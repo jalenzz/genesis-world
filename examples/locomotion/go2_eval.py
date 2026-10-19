@@ -14,6 +14,7 @@ from rsl_rl.runners import OnPolicyRunner
 
 import genesis as gs
 
+from dreamwaq import DreamWaQRunner
 from go2_env import Go2Env
 
 
@@ -41,7 +42,8 @@ def main():
         show_viewer=True,
     )
 
-    runner = OnPolicyRunner(env, train_cfg, log_dir, device=gs.device)
+    runner_cls = DreamWaQRunner if env_cfg.get("estimator") == "cenet" else OnPolicyRunner
+    runner = runner_cls(env, train_cfg, log_dir, device=gs.device)
     runner.load(os.path.join(log_dir, f"model_{args.ckpt}.pt"))
     policy = runner.get_inference_policy(device=gs.device)
 
@@ -57,6 +59,7 @@ if __name__ == "__main__":
 
 """
 # evaluation. The log's saved config selects flat ground or the curriculum terrain.
+# A curriculum log loads the estimator and feeds the actor proprioception, estimated velocity and the latent.
 # A curriculum log whose collision budget is still the flat 20 is widened. An overflow halts instead of respawning.
 python examples/locomotion/go2_eval.py -e go2-walking --ckpt 100
 """

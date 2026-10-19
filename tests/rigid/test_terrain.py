@@ -1,5 +1,6 @@
 import importlib.util
 import os
+import sys
 from pathlib import Path
 
 import igl
@@ -15,7 +16,11 @@ from genesis.utils.misc import get_assets_dir, tensor_to_array
 
 from ..utils.assertions import assert_allclose
 
-_GO2_ENV_PATH = Path(__file__).resolve().parents[2] / "examples" / "locomotion" / "go2_env.py"
+_LOCOMOTION_DIR = Path(__file__).resolve().parents[2] / "examples" / "locomotion"
+sys.path.insert(0, str(_LOCOMOTION_DIR))
+from cenet import CENet, HISTORY_STEPS, LATENT_DIM, adaboot_truth_probability, adaboot_uses_truth
+
+_GO2_ENV_PATH = _LOCOMOTION_DIR / "go2_env.py"
 _go2_spec = importlib.util.spec_from_file_location("go2_locomotion_env", _GO2_ENV_PATH)
 go2_locomotion_env = importlib.util.module_from_spec(_go2_spec)
 _go2_spec.loader.exec_module(go2_locomotion_env)
@@ -489,7 +494,24 @@ def test_curriculum_terrain_tracking(n_envs, show_viewer):
         command_cfg=command_cfg,
         show_viewer=show_viewer,
     )
-    assert env.get_observations()["policy"].shape[-1] == 45
+    obs = env.get_observations()
+    assert obs["proprio"].shape[-1] == 45
+    assert obs["est_vel"].shape[-1] == 3
+    assert obs["latent"].shape[-1] == LATENT_DIM
+    assert obs["disturbance"].shape[-1] == 3
+    assert tuple(obs["history"].shape[-2:]) == (HISTORY_STEPS, 45)
+    assert torch.allclose(obs["lin_vel"], torch.zeros_like(obs["lin_vel"]))
+    assert obs["est_vel"].abs().max() > 1.0e-3
+    assert all("height" not in key for key in obs.keys())
+    groups = go2_locomotion_env.estimator_obs_groups()
+    actor_input = torch.cat([obs[name] for name in groups["actor"]], dim=-1)
+    critic_input = torch.cat([obs[name] for name in groups["critic"]], dim=-1)
+    assert groups["actor"] == ["proprio", "est_vel", "latent"]
+    assert actor_input.shape[-1] == 45 + 3 + LATENT_DIM
+    assert "lin_vel" not in groups["actor"]
+    assert "disturbance" not in groups["actor"]
+    assert groups["critic"] == ["proprio", "lin_vel", "disturbance"]
+    assert critic_input.shape[-1] == 45 + 3 + 3
 
     smooth_level0 = (0.5 * subterrain_size[0], 0.5 * subterrain_size[1])
     smooth_level9 = (9.5 * subterrain_size[0], 0.5 * subterrain_size[1])
@@ -612,3 +634,50 @@ def test_curriculum_action_reaches_joints(n_envs, show_viewer):
     spawn_x = 0.5 * subterrain_size[0]
     spawn_xs = qpos[0] if n_envs == 0 else qpos[:, 0]
     assert ((spawn_xs - spawn_x).abs() < 0.5).all()
+
+
+def test_cenet_belief_and_actor_groups():
+    proprio_dim = 45
+    batch = 4
+    net = CENet(proprio_dim)
+    history = torch.randn(batch, HISTORY_STEPS, proprio_dim)
+    belief = net.encode(history)
+    assert belief.velocity.shape == (batch, 3)
+    assert belief.mean.shape == (batch, LATENT_DIM)
+    assert belief.log_variance.shape == (batch, LATENT_DIM)
+    latent = net.reparameterize(belief)
+    reconstructed = net.decode(latent)
+    assert latent.shape == (batch, LATENT_DIM)
+    assert reconstructed.shape == (batch, proprio_dim)
+    velocity = torch.randn(batch, 3)
+    next_proprio = torch.randn(batch, proprio_dim)
+    loss = net.loss(history, velocity, next_proprio)
+    assert loss.ndim == 0
+    assert torch.isfinite(loss)
+    loss.backward()
+    assert net.velocity_head.weight.grad is not None
+    assert net.decoder[0].weight.grad is not None
+
+    empty_returns = torch.empty(0)
+    assert torch.allclose(adaboot_truth_probability(empty_returns), torch.ones(()))
+    assert adaboot_uses_truth(empty_returns, torch.zeros(()))
+    same_returns = torch.ones(8)
+    assert torch.allclose(adaboot_truth_probability(same_returns), torch.zeros(()))
+    assert not adaboot_uses_truth(same_returns, torch.tensor(0.5))
+    varied_returns = torch.tensor([0.0, 2.0])
+    expected = torch.tanh(varied_returns.std(unbiased=False) / varied_returns.mean().abs())
+    assert torch.allclose(adaboot_truth_probability(varied_returns), expected)
+    assert adaboot_uses_truth(varied_returns, torch.zeros(()))
+    assert not adaboot_uses_truth(varied_returns, torch.ones(()))
+
+    env_cfg, _, reward_cfg, _ = go2_locomotion_env.locomotion_cfgs()
+    flat_groups = go2_locomotion_env.policy_obs_groups(env_cfg)
+    assert flat_groups["actor"] == ["policy"]
+    assert flat_groups["critic"] == ["policy"]
+    go2_locomotion_env.apply_curriculum(env_cfg, reward_cfg)
+    dream_groups = go2_locomotion_env.policy_obs_groups(env_cfg)
+    assert dream_groups["actor"] == ["proprio", "est_vel", "latent"]
+    assert dream_groups["critic"] == ["proprio", "lin_vel", "disturbance"]
+    assert "lin_vel" not in dream_groups["actor"]
+    assert "disturbance" not in dream_groups["actor"]
+    assert all("height" not in group for group in dream_groups["actor"])

@@ -15,6 +15,8 @@ from genesis.ext.isaacgym.terrain_utils import (
 )
 from genesis.utils.geom import inv_quat, quat_to_xyz, transform_by_quat, transform_quat_by_quat
 
+from cenet import CENet, HISTORY_STEPS, LATENT_DIM, adaboot_uses_truth as adaboot_batch_uses_truth
+
 
 def gs_rand(lower, upper, batch_shape):
     assert lower.shape == upper.shape
@@ -149,15 +151,39 @@ def curriculum_reward_scales():
     }
 
 
+def estimator_obs_groups():
+    """Return the actor and critic observation groups used with the context estimator.
+
+    The actor reads the current proprioception, the estimated base linear velocity and the latent. The critic reads the
+    proprioception together with the measured base linear velocity and the disturbance.
+    """
+    return {
+        "actor": ["proprio", "est_vel", "latent"],
+        "critic": ["proprio", "lin_vel", "disturbance"],
+    }
+
+
+def policy_obs_groups(env_cfg):
+    """Return the actor and critic groups saved with a walking config.
+
+    The flat walker keeps the single proprioceptive group. The curriculum config selects the estimator groups.
+    """
+    if env_cfg.get("estimator") == "cenet":
+        return estimator_obs_groups()
+    return {"actor": ["policy"], "critic": ["policy"]}
+
+
 def apply_curriculum(env_cfg, reward_cfg):
     """Point a walking config at the terrain curriculum and its reward weights.
 
     The flat-ground entry leaves these fields unset. A height field produces more foot contacts than a plane, so the
-    collision budget is raised with the terrain.
+    collision budget is raised with the terrain. The curriculum actor reads an estimated base velocity, so the context
+    estimator is enabled here and stays off for the flat walker.
     """
     env_cfg["terrain"] = "curriculum"
     env_cfg["domain_randomization"] = True
     env_cfg["max_collision_pairs"] = 256
+    env_cfg["estimator"] = "cenet"
     reward_cfg["reward_scales"] = curriculum_reward_scales()
 
 
@@ -425,6 +451,20 @@ class Go2Env:
         self.episode_tracking_lin = torch.zeros((self._batch_n,), dtype=gs.tc_float, device=gs.device)
         self._feet_air_time = torch.zeros((self._batch_n, len(FOOT_LINK_NAMES)), dtype=gs.tc_float, device=gs.device)
         self._push_force = torch.zeros((self._batch_n, 3), dtype=gs.tc_float, device=gs.device)
+        self._cenet = None
+        self._cenet_optimizer = None
+        self._finished_returns = []
+        self._is_ground_truth = False
+        self._is_latent_sampled = False
+        self._published_observations = None
+        self._proprio_dim = 9 + self.num_actions * 3
+        if env_cfg.get("estimator") == "cenet":
+            self._cenet = CENet(self._proprio_dim).to(device=gs.device, dtype=gs.tc_float)
+            self._cenet_optimizer = torch.optim.Adam(self._cenet.parameters(), lr=1.0e-3)
+            self._history = torch.zeros(
+                (self._batch_n, HISTORY_STEPS, self._proprio_dim), dtype=gs.tc_float, device=gs.device
+            )
+            self._episode_return = torch.zeros((self._batch_n,), dtype=gs.tc_float, device=gs.device)
         self._feet_pos = None
         self._feet_vel = None
         self._feet_contact = None
@@ -634,6 +674,8 @@ class Go2Env:
             rew = reward_func() * self.reward_scales[name]
             self.rew_buf += rew
             self.episode_sums[name] += rew
+        if self._cenet is not None:
+            self._episode_return += self.rew_buf
 
         self._resample_commands(self.episode_length_buf % int(self.env_cfg["resampling_time_s"] / self.dt) == 0)
 
@@ -664,7 +706,83 @@ class Go2Env:
         return self.get_observations(), self.rew_buf, self.reset_buf, self.extras
 
     def get_observations(self):
-        return TensorDict({"policy": self.obs_buf}, batch_size=[self._batch_n])
+        if self._cenet is None:
+            self._published_observations = TensorDict({"policy": self.obs_buf}, batch_size=[self._batch_n])
+            return self._published_observations
+        velocity, latent = self._velocity_and_latent()
+        self._published_observations = TensorDict(
+            {
+                "proprio": self.obs_buf,
+                "est_vel": velocity,
+                "latent": latent,
+                "lin_vel": self.base_lin_vel,
+                "disturbance": self._push_force,
+                "history": self._history,
+            },
+            batch_size=[self._batch_n],
+        )
+        return self._published_observations
+
+    def _velocity_and_latent(self):
+        """Return the base velocity and latent the actor reads on this step."""
+        if self._is_ground_truth:
+            # The latent has no measured value. Zero is the mean of its standard normal prior.
+            latent = torch.zeros((self._batch_n, LATENT_DIM), dtype=gs.tc_float, device=gs.device)
+            return self.base_lin_vel, latent
+        belief = self._cenet.encode(self._history)
+        latent = self._cenet.reparameterize(belief) if self._is_latent_sampled else belief.mean
+        return belief.velocity, latent
+
+    def set_estimator_ground_truth(self, use_ground_truth):
+        """Choose measured velocity or the estimator for the actor, including the observation already published."""
+        self._is_ground_truth = use_ground_truth
+        if self._cenet is None or self._published_observations is None:
+            return
+        velocity, latent = self._velocity_and_latent()
+        self._published_observations["est_vel"] = velocity
+        self._published_observations["latent"] = latent
+
+    def set_latent_sampling(self, sample_latent):
+        """Sample the latent during a rollout, or publish its mean."""
+        self._is_latent_sampled = sample_latent
+
+    def adaboot_uses_truth(self):
+        """Return whether the next batch should read ground truth, from the returns finished in this batch."""
+        if self._cenet is None or len(self._finished_returns) == 0:
+            return True
+        returns = torch.cat(self._finished_returns)
+        self._finished_returns.clear()
+        return adaboot_batch_uses_truth(returns, torch.rand((), dtype=gs.tc_float, device=gs.device))
+
+    def update_estimator(self, storage):
+        """Fit the context estimator on one rollout and return its loss.
+
+        The reconstruction target is the next stored proprioception. A finished step is left out, because the following
+        observation belongs to the next episode. A rollout with no continuing step returns zero.
+        """
+        if self._cenet is None:
+            return 0.0
+        history = storage.observations["history"][:-1]
+        next_proprio = storage.observations["proprio"][1:]
+        velocity = storage.observations["lin_vel"][:-1]
+        alive = storage.dones[:-1].squeeze(-1) == 0
+        if not bool(alive.any()):
+            return 0.0
+        self._cenet.train()
+        loss = self._cenet.loss(history[alive], velocity[alive], next_proprio[alive])
+        self._cenet_optimizer.zero_grad()
+        loss.backward()
+        self._cenet_optimizer.step()
+        return float(loss.detach())
+
+    def cenet_state_dict(self):
+        """Return the estimator weights and optimizer state."""
+        return {"model": self._cenet.state_dict(), "optimizer": self._cenet_optimizer.state_dict()}
+
+    def load_cenet_state_dict(self, state):
+        """Load estimator weights and optimizer state saved beside the policy."""
+        self._cenet.load_state_dict(state["model"])
+        self._cenet_optimizer.load_state_dict(state["optimizer"])
 
     def _reset_idx(self, envs_idx=None):
         self._update_terrain_curriculum(envs_idx)
@@ -675,6 +793,10 @@ class Go2Env:
             self.robot.set_qpos(self._spawn_qpos(), envs_idx=pose_envs, zero_velocity=True, skip_forward=True)
 
         # reset buffers
+        if self._cenet is not None:
+            finished_mask = self._reset_mask(envs_idx) & (self.episode_length_buf > 0)
+            if bool(finished_mask.any()):
+                self._finished_returns.append(self._episode_return[finished_mask].detach().clone())
         if envs_idx is None:
             self.base_pos.copy_(self.init_base_pos)
             self.base_quat.copy_(self.init_base_quat)
@@ -690,6 +812,8 @@ class Go2Env:
             self.episode_tracking_lin.zero_()
             self._feet_air_time.zero_()
             self.reset_buf.fill_(True)
+            if self._cenet is not None:
+                self._episode_return.zero_()
         else:
             torch.where(envs_idx[:, None], self.init_base_pos, self.base_pos, out=self.base_pos)
             torch.where(envs_idx[:, None], self.init_base_quat, self.base_quat, out=self.base_quat)
@@ -707,6 +831,8 @@ class Go2Env:
             self.episode_tracking_lin.masked_fill_(envs_idx, 0.0)
             self._feet_air_time.masked_fill_(envs_idx[:, None], 0.0)
             self.reset_buf.masked_fill_(envs_idx, True)
+            if self._cenet is not None:
+                self._episode_return.masked_fill_(envs_idx, 0.0)
 
         if self.terrain is not None:
             origin = self._cell_origins[self.terrain_levels, self.terrain_types]
@@ -744,6 +870,14 @@ class Go2Env:
             ),
             dim=-1,
         )
+        if self._cenet is None:
+            return
+        assert self.obs_buf.shape[-1] == self._proprio_dim
+        rolled = torch.roll(self._history, shifts=-1, dims=1)
+        rolled[:, -1] = self.obs_buf
+        filled = self.obs_buf[:, None, :].expand_as(self._history)
+        # Filling the whole window drops the previous episode. A roll would leave it in the encoder's context.
+        self._history = torch.where(self.reset_buf[:, None, None], filled, rolled)
 
     def reset(self):
         self._reset_idx()

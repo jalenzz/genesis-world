@@ -13,7 +13,8 @@ from rsl_rl.runners import OnPolicyRunner
 
 import genesis as gs
 
-from go2_env import Go2Env, apply_curriculum, locomotion_cfgs
+from dreamwaq import DreamWaQRunner
+from go2_env import Go2Env, apply_curriculum, locomotion_cfgs, policy_obs_groups
 
 
 def get_train_cfg(exp_name):
@@ -61,6 +62,13 @@ def get_train_cfg(exp_name):
     return train_cfg_dict
 
 
+def configure_train_cfg(exp_name, env_cfg):
+    """Return the runner config, with estimator observation groups when the estimator is on."""
+    train_cfg = get_train_cfg(exp_name)
+    train_cfg["obs_groups"] = policy_obs_groups(env_cfg)
+    return train_cfg
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument(
@@ -84,7 +92,7 @@ def main():
     env_cfg, obs_cfg, reward_cfg, command_cfg = locomotion_cfgs()
     if args.terrain == "curriculum":
         apply_curriculum(env_cfg, reward_cfg)
-    train_cfg = get_train_cfg(args.exp_name)
+    train_cfg = configure_train_cfg(args.exp_name, env_cfg)
 
     if os.path.exists(log_dir):
         shutil.rmtree(log_dir)
@@ -100,7 +108,8 @@ def main():
         num_envs=args.num_envs, env_cfg=env_cfg, obs_cfg=obs_cfg, reward_cfg=reward_cfg, command_cfg=command_cfg
     )
 
-    runner = OnPolicyRunner(env, train_cfg, log_dir, device=gs.device)
+    runner_cls = DreamWaQRunner if env_cfg.get("estimator") == "cenet" else OnPolicyRunner
+    runner = runner_cls(env, train_cfg, log_dir, device=gs.device)
 
     runner.learn(num_learning_iterations=args.max_iterations, init_at_random_ep_len=True)
 
@@ -112,6 +121,6 @@ if __name__ == "__main__":
 # training, flat ground
 python examples/locomotion/go2_train.py
 
-# training, curriculum terrain
+# training, curriculum terrain. The actor reads proprioception, estimated velocity and the latent.
 python examples/locomotion/go2_train.py -e go2-curriculum --terrain curriculum
 """
