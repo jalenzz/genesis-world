@@ -25,15 +25,8 @@ def gs_rand(lower, upper, batch_shape):
 
 # Columns of the curriculum grid, in order. Rows are the difficulty levels.
 TERRAIN_KINDS = ("smooth_slope", "rough_slope", "discrete_obstacles", "stairs")
-# Obstacles and stairs are listed twice so those columns receive twice the episodes of one slope column.
-TERRAIN_PRACTICE = (
-    TERRAIN_KINDS.index("smooth_slope"),
-    TERRAIN_KINDS.index("rough_slope"),
-    TERRAIN_KINDS.index("discrete_obstacles"),
-    TERRAIN_KINDS.index("discrete_obstacles"),
-    TERRAIN_KINDS.index("stairs"),
-    TERRAIN_KINDS.index("stairs"),
-)
+# Episode share of each column. Slopes and stairs take most of the batch. Obstacles stay present.
+TERRAIN_KIND_FRACTIONS = (0.30, 0.28, 0.15, 0.27)
 # Consecutive episodes above the tracking bar before an obstacle or stair row may rise.
 SLOW_PROMOTE_EPISODES = 2
 
@@ -495,9 +488,16 @@ class Go2Env:
             device=gs.device,
         )
         self.extras = dict()  # extra information for logging
-        self.terrain_levels = torch.zeros((self._batch_n,), dtype=gs.tc_int, device=gs.device)
-        practice = torch.tensor(TERRAIN_PRACTICE, dtype=gs.tc_int, device=gs.device)
-        self.terrain_types = practice[torch.arange(self._batch_n, device=gs.device) % practice.shape[0]]
+        kind_weights = torch.tensor(TERRAIN_KIND_FRACTIONS, dtype=gs.tc_float, device=gs.device)
+        self.terrain_types = torch.multinomial(kind_weights, self._batch_n, replacement=True)
+        # The flat row keeps a twelve percent share plus its ramp weight. The ramp follows the row index, so upper
+        # rows are more common than a uniform draw.
+        level_index = torch.arange(self._n_levels, dtype=gs.tc_float, device=gs.device)
+        ramp = (level_index + 1.0) / (level_index + 1.0).sum()
+        easy = torch.zeros((self._n_levels,), dtype=gs.tc_float, device=gs.device)
+        easy[0] = 1.0
+        level_weights = 0.12 * easy + 0.88 * ramp
+        self.terrain_levels = torch.multinomial(level_weights, self._batch_n, replacement=True)
         self._promote_streak = torch.zeros((self._batch_n,), dtype=gs.tc_int, device=gs.device)
         self._obstacle_kind = TERRAIN_KINDS.index("discrete_obstacles")
         self._stair_kind = TERRAIN_KINDS.index("stairs")
