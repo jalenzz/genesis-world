@@ -3,6 +3,9 @@ import os
 import pickle
 from importlib import metadata
 
+os.environ.setdefault("PYGAME_HIDE_SUPPORT_PROMPT", "1")
+
+import pygame
 import torch
 
 try:
@@ -13,9 +16,17 @@ except (metadata.PackageNotFoundError, ImportError, ValueError) as e:
 from rsl_rl.runners import OnPolicyRunner
 
 import genesis as gs
+from genesis.vis.keybindings import Key, KeyAction, Keybind
 
 from dreamwaq import DreamWaQRunner
 from go2_env import TERRAIN_KINDS, Go2Env
+
+# Resting Xbox sticks sit a little off center. Inside this band the command is 0.
+STICK_DEADZONE = 0.15
+# pygame axis indices for this pad. SDL names them leftx, lefty, and rightx.
+LEFT_STICK_X = 0
+LEFT_STICK_Y = 1
+RIGHT_STICK_X = 2
 
 
 def _load_cfgs(exp_name):
@@ -180,7 +191,9 @@ def run_metrics(args):
     mean_abs_action = action_abs / action_count
     print(f"ckpt={ckpt_path}")
     print(f"terrain={env._terrain_kind} collision_pairs={collision_pairs}")
-    print(f"command_cfg_vx={command_cfg['lin_vel_x_range']} vy={command_cfg['lin_vel_y_range']} yaw={command_cfg['ang_vel_range']}")
+    print(
+        f"command_cfg_vx={command_cfg['lin_vel_x_range']} vy={command_cfg['lin_vel_y_range']} yaw={command_cfg['ang_vel_range']}"
+    )
     print(f"dt={env.dt} steps_4s={steps_4s} steps_total={steps_total}")
     print(f"mean_abs_action={mean_abs_action:.6f}")
     print(f"roll_pitch_limits_deg={roll_limit},{pitch_limit} height_collapse_m=0.150")
@@ -228,31 +241,56 @@ def run_metrics(args):
     return reported
 
 
-def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument(
-        "-e", "--exp-name", type=str, default="go2-walking", help="Experiment name; also the log directory under logs/"
-    )
-    parser.add_argument("--ckpt", type=int, default=100, help="Checkpoint iteration to load")
-    parser.add_argument("--metrics", action="store_true", help="Print displacement, tracking and fall counts, then exit")
-    parser.add_argument("--num-envs", type=int, default=1)
-    parser.add_argument("--terrain", choices=("config", "plane", "curriculum"), default="config")
-    parser.add_argument("--vx", type=float, default=0.5, help="Forward command in m/s, held for the whole run")
-    parser.add_argument("--also-vx", type=float, default=None, help="Forward command used by the second half of the envs")
-    parser.add_argument("--episode-seconds", type=float, default=20.0)
-    parser.add_argument("--video", type=str, default="")
-    parser.add_argument("--video-seconds", type=float, default=8.0)
-    args = parser.parse_args()
+def _open_pad():
+    """Open the first joystick pygame enumerates, or return None when no pad is connected."""
+    # A dummy video driver keeps pygame from opening a window beside the viewer.
+    os.environ["SDL_VIDEODRIVER"] = "dummy"
+    os.environ["SDL_JOYSTICK_ALLOW_BACKGROUND_EVENTS"] = "1"
+    if not pygame.display.get_init():
+        pygame.display.init()
+    if not pygame.joystick.get_init():
+        pygame.joystick.init()
+    if pygame.joystick.get_count() < 1:
+        return None
+    pad = pygame.joystick.Joystick(0)
+    pad.init()
+    return pad
 
-    if args.metrics:
-        run_metrics(args)
-        return
 
+def _stick_command(pad):
+    """Return vx, vy, and yaw in [-1, 1]. A stick inside the deadzone contributes 0."""
+    pygame.event.pump()
+    # SDL reports X to the right and Y downward. vx is forward, vy is left, and yaw is left.
+    vx = -pad.get_axis(LEFT_STICK_Y)
+    vy = -pad.get_axis(LEFT_STICK_X)
+    yaw = -pad.get_axis(RIGHT_STICK_X)
+    return tuple(value if abs(value) >= STICK_DEADZONE else 0.0 for value in (vx, vy, yaw))
+
+
+def _publish_command(env, command):
+    env.commands[:, 0] = command[0]
+    env.commands[:, 1] = command[1]
+    env.commands[:, 2] = command[2]
+    env._update_observation()
+    return env.get_observations()
+
+
+def run_teleop(args):
     gs.init(backend=gs.cpu)
 
     log_dir = f"logs/{args.exp_name}"
     env_cfg, obs_cfg, reward_cfg, command_cfg, train_cfg = _load_cfgs(args.exp_name)
     reward_cfg["reward_scales"] = {}
+    ckpt_path = os.path.join(log_dir, f"model_{args.ckpt}.pt")
+
+    pad = _open_pad()
+    held_keys = set()
+
+    def hold_key(name):
+        held_keys.add(name)
+
+    def release_key(name):
+        held_keys.discard(name)
 
     env = Go2Env(
         num_envs=1,
@@ -263,24 +301,100 @@ def main():
         show_viewer=True,
     )
 
+    def axis_keybinds(name, key, held_name):
+        return (
+            Keybind(f"{name}_press", key, KeyAction.PRESS, callback=hold_key, args=(held_name,)),
+            Keybind(f"{name}_release", key, KeyAction.RELEASE, callback=release_key, args=(held_name,)),
+        )
+
+    is_running = True
+
+    def stop():
+        nonlocal is_running
+        is_running = False
+
+    env.scene.viewer.register_keybinds(
+        *axis_keybinds("forward", Key.W, "w"),
+        *axis_keybinds("backward", Key.S, "s"),
+        *axis_keybinds("strafe_left", Key.Q, "q"),
+        *axis_keybinds("strafe_right", Key.E, "e"),
+        *axis_keybinds("yaw_left", Key.A, "a"),
+        *axis_keybinds("yaw_right", Key.D, "d"),
+        Keybind("quit", Key.ESCAPE, KeyAction.RELEASE, callback=stop),
+        overwrite=True,
+    )
+
     runner_cls = DreamWaQRunner if env_cfg.get("estimator") == "cenet" else OnPolicyRunner
     runner = runner_cls(env, train_cfg, log_dir, device=gs.device)
-    runner.load(os.path.join(log_dir, f"model_{args.ckpt}.pt"))
+    runner.load(ckpt_path)
     policy = runner.get_inference_policy(device=gs.device)
 
+    pad_name = "none" if pad is None else pad.get_name()
+    print(
+        f"ckpt={ckpt_path} pad={pad_name} deadzone={STICK_DEADZONE} "
+        f"vx=-axis{LEFT_STICK_Y} vy=-axis{LEFT_STICK_X} yaw=-axis{RIGHT_STICK_X} "
+        "keys W/S vx, Q/E vy, A/D yaw, Esc quit"
+    )
+
     obs_dict = env.reset()
+
+    def command():
+        vx = (1.0 if "w" in held_keys else 0.0) - (1.0 if "s" in held_keys else 0.0)
+        vy = (1.0 if "q" in held_keys else 0.0) - (1.0 if "e" in held_keys else 0.0)
+        yaw = (1.0 if "a" in held_keys else 0.0) - (1.0 if "d" in held_keys else 0.0)
+        keys = (vx, vy, yaw)
+        if pad is None:
+            return keys
+        stick = _stick_command(pad)
+        return tuple(stick[i] if abs(stick[i]) >= STICK_DEADZONE else keys[i] for i in range(3))
+
+    obs_dict = _publish_command(env, command())
     with torch.no_grad():
-        while True:
+        while is_running and env.scene.viewer.is_alive():
             actions = policy(obs_dict)
             obs_dict, _rews, _dones, _infos = env.step(actions)
+            obs_dict = _publish_command(env, command())
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "-e",
+        "--exp-name",
+        type=str,
+        default="go2-smooth-slope",
+        help="Experiment name; also the log directory under logs/",
+    )
+    parser.add_argument("--ckpt", type=int, default=2999, help="Checkpoint iteration to load")
+    parser.add_argument(
+        "--metrics", action="store_true", help="Print displacement, tracking and fall counts, then exit"
+    )
+    parser.add_argument("--num-envs", type=int, default=1)
+    parser.add_argument("--terrain", choices=("config", "plane", "curriculum"), default="config")
+    parser.add_argument("--vx", type=float, default=0.5, help="Forward command in m/s, held for the whole run")
+    parser.add_argument(
+        "--also-vx", type=float, default=None, help="Forward command used by the second half of the envs"
+    )
+    parser.add_argument("--episode-seconds", type=float, default=20.0)
+    parser.add_argument("--video", type=str, default="")
+    parser.add_argument("--video-seconds", type=float, default=8.0)
+    args = parser.parse_args()
+
+    if args.metrics:
+        run_metrics(args)
+        return
+
+    run_teleop(args)
 
 
 if __name__ == "__main__":
     main()
 
 """
-# evaluation. The log's saved config selects flat ground or the curriculum terrain.
-# A curriculum log loads the estimator and feeds the actor proprioception, estimated velocity and the latent.
-# A curriculum log whose collision budget is still the flat 20 is widened. An overflow halts instead of respawning.
-python examples/locomotion/go2_eval.py -e go2-walking --ckpt 100
+# Teleop on logs/go2-smooth-slope/model_2999.pt. Left stick is vx/vy, right stick x is yaw, each in [-1, 1].
+# W/S, Q/E, and A/D command the same axes when the pad is absent or that stick is inside the deadzone.
+uv run python examples/locomotion/go2_eval.py
+
+# Metrics. The log's saved config selects flat ground or the curriculum terrain.
+python examples/locomotion/go2_eval.py -e go2-walking --ckpt 100 --metrics
 """
