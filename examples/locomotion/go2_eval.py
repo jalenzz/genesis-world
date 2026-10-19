@@ -56,6 +56,6 @@ if __name__ == "__main__":
     main()
 
 """
-# evaluation
+# evaluation. The log's saved config selects flat ground or the curriculum terrain.
 python examples/locomotion/go2_eval.py -e go2-walking --ckpt 100
 """

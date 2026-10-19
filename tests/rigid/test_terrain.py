@@ -1,4 +1,6 @@
+import importlib.util
 import os
+from pathlib import Path
 
 import igl
 import numpy as np
@@ -12,6 +14,11 @@ import genesis.utils.terrain as tu
 from genesis.utils.misc import get_assets_dir, tensor_to_array
 
 from ..utils.assertions import assert_allclose
+
+_GO2_ENV_PATH = Path(__file__).resolve().parents[2] / "examples" / "locomotion" / "go2_env.py"
+_go2_spec = importlib.util.spec_from_file_location("go2_locomotion_env", _GO2_ENV_PATH)
+go2_locomotion_env = importlib.util.module_from_spec(_go2_spec)
+_go2_spec.loader.exec_module(go2_locomotion_env)
 
 
 @pytest.mark.parametrize(
@@ -444,3 +451,101 @@ def test_multicontact_sphere_vs_terrain(show_viewer, tol):
 
     vel_final = tensor_to_array(sphere.get_dofs_velocity())
     assert_allclose(vel_final, 0.0, tol=1e-5)
+
+
+@pytest.mark.parametrize("n_envs", [0, 2])
+def test_curriculum_terrain_tracking(n_envs, show_viewer):
+    env_cfg, obs_cfg, reward_cfg, command_cfg = go2_locomotion_env.locomotion_cfgs()
+    go2_locomotion_env.apply_curriculum(env_cfg, reward_cfg)
+    subterrain_size = (4.0, 4.0)
+    env_cfg["episode_length_s"] = 1.0
+    env_cfg["termination_if_roll_greater_than"] = 180
+    env_cfg["termination_if_pitch_greater_than"] = 180
+    env_cfg["curriculum_up"] = 0.5
+    env_cfg["curriculum_down"] = 0.05
+    env_cfg["terrain_subterrain_size"] = subterrain_size
+    env_cfg["terrain_horizontal_scale"] = 0.5
+    env_cfg["terrain_vertical_scale"] = 0.01
+    env_cfg["randomization"] = dict(
+        friction=(0.8, 1.2),
+        mass_scale=(0.9, 1.1),
+        com_offset=0.0,
+        inertia_scale=(1.0, 1.0),
+        gain_scale=(1.0, 1.0),
+        force_scale=(1.0, 1.0),
+        gravity_scale=(1.0, 1.0),
+        push_xy=0.0,
+        push_z=0.0,
+    )
+    command_cfg["lin_vel_x_range"] = [0.0, 0.0]
+    command_cfg["lin_vel_y_range"] = [0.0, 0.0]
+    command_cfg["ang_vel_range"] = [0.0, 0.0]
+
+    env = go2_locomotion_env.Go2Env(
+        num_envs=n_envs,
+        env_cfg=env_cfg,
+        obs_cfg=obs_cfg,
+        reward_cfg=reward_cfg,
+        command_cfg=command_cfg,
+        show_viewer=show_viewer,
+    )
+    assert env.get_observations()["policy"].shape[-1] == 45
+
+    smooth_level0 = (0.5 * subterrain_size[0], 0.5 * subterrain_size[1])
+    smooth_level9 = (9.5 * subterrain_size[0], 0.5 * subterrain_size[1])
+    stairs_level0 = (0.5 * subterrain_size[0], 3.5 * subterrain_size[1])
+    stairs_level9 = (9.5 * subterrain_size[0], 3.5 * subterrain_size[1])
+    terrain_heights = env.terrain.get_terrain_height((smooth_level0, smooth_level9, stairs_level0, stairs_level9))
+    if n_envs > 0:
+        terrain_heights = terrain_heights[0]
+    # The center is the pyramid platform. On this coarse 4 m cell the 22 degree slope only lifts it by about 0.22 m.
+    assert terrain_heights[1] > terrain_heights[0] + 0.2
+    assert terrain_heights[3] > terrain_heights[2] + 0.15
+    assert (terrain_heights[0].abs() < 0.05).all()
+
+    mass_before = env.robot.get_links_mass().clone()
+    batch_n = n_envs if n_envs > 0 else 1
+    actions = torch.zeros((batch_n, env.num_actions), dtype=gs.tc_float, device=gs.device)
+    for _ in range(env.max_episode_length):
+        env.step(actions)
+    assert torch.isfinite(env.rew_buf).all()
+
+    feet_idx = [env.robot.get_link(name).idx_local for name in ("FR_foot", "FL_foot", "RR_foot", "RL_foot")]
+    feet_pos = env.robot.get_links_pos(feet_idx)
+    base_pos = env.robot.get_pos()
+    if n_envs == 0:
+        foot_ground = env.terrain.get_terrain_height(feet_pos[:, :2])
+        clearance = feet_pos[:, 2] - foot_ground
+        base_ground = env.terrain.get_terrain_height(base_pos[:2])
+        base_height = base_pos[2] - base_ground
+    else:
+        foot_ground = env.terrain.get_terrain_height(feet_pos[..., :2])
+        clearance = feet_pos[..., 2] - foot_ground
+        base_ground = env.terrain.get_terrain_height(base_pos[:, None, :2])[:, 0]
+        base_height = base_pos[:, 2] - base_ground
+    assert (clearance > -0.03).all()
+    nearest = clearance.min() if n_envs == 0 else clearance.min(dim=-1).values
+    assert (nearest < 0.08).all()
+    assert (base_height > 0.2).all()
+    assert (base_height < 0.55).all()
+
+    env.step(actions)
+    qpos = env.robot.get_qpos()
+    promoted_x = 1.5 * subterrain_size[0]
+    if n_envs == 0:
+        assert_allclose(qpos[:2], (promoted_x, 0.5 * subterrain_size[1]), atol=1e-4, rtol=0.0)
+    else:
+        assert_allclose(qpos[:, 0], promoted_x, atol=1e-4, rtol=0.0)
+        assert_allclose(
+            qpos[:, 1],
+            (torch.arange(n_envs, device=qpos.device) + 0.5) * subterrain_size[1],
+            atol=1e-4,
+            rtol=0.0,
+        )
+    mass_after = env.robot.get_links_mass()
+    assert ((mass_after - mass_before).abs() > 1e-3).any()
+    ratio = mass_after / mass_before
+    assert (ratio > 0.9 / 1.1).all()
+    assert (ratio < 1.1 / 0.9).all()
+    if n_envs > 0:
+        assert ((mass_after[0] - mass_after[1]).abs() > 1e-3).any()
