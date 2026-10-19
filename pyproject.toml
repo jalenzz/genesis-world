@@ -77,8 +77,6 @@ dependencies = [
     "fast_simplification>=0.1.12",
     # Surface reconstruction library for particle data from SPH simulations
     "pysplashsurf==0.14.*",
-    # Xbox pad axis reads for the Go2 locomotion teleop
-    "pygame>=2.5.0",
 ]
 
 [project.optional-dependencies]
