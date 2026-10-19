@@ -25,8 +25,11 @@ def gs_rand(lower, upper, batch_shape):
 
 # Columns of the curriculum grid, in order. Rows are the difficulty levels.
 TERRAIN_KINDS = ("smooth_slope", "rough_slope", "discrete_obstacles", "stairs")
-# Episode share of each column. Slopes and stairs take most of the batch. Obstacles stay present.
-TERRAIN_KIND_FRACTIONS = (0.30, 0.28, 0.15, 0.27)
+# Episode share of each column. Smooth slopes take half the batch. Rough slopes, obstacles, and stairs stay present.
+TERRAIN_KIND_FRACTIONS = (0.48, 0.20, 0.12, 0.20)
+# Flat-row share mixed into the row weights. Smooth slopes use the smaller share with a squared ramp.
+SMOOTH_FLAT_ROW_SHARE = 0.06
+OTHER_FLAT_ROW_SHARE = 0.12
 # Consecutive episodes above the tracking bar before an obstacle or stair row may rise.
 SLOW_PROMOTE_EPISODES = 2
 
@@ -490,14 +493,19 @@ class Go2Env:
         self.extras = dict()  # extra information for logging
         kind_weights = torch.tensor(TERRAIN_KIND_FRACTIONS, dtype=gs.tc_float, device=gs.device)
         self.terrain_types = torch.multinomial(kind_weights, self._batch_n, replacement=True)
-        # The flat row keeps a twelve percent share plus its ramp weight. The ramp follows the row index, so upper
-        # rows are more common than a uniform draw.
+        # Smooth slopes weight a row by the square of its index, so the steep rows take most of that column. The other
+        # columns keep a linear ramp on the row index. Both mixes keep a flat-row share.
         level_index = torch.arange(self._n_levels, dtype=gs.tc_float, device=gs.device)
-        ramp = (level_index + 1.0) / (level_index + 1.0).sum()
-        easy = torch.zeros((self._n_levels,), dtype=gs.tc_float, device=gs.device)
-        easy[0] = 1.0
-        level_weights = 0.12 * easy + 0.88 * ramp
-        self.terrain_levels = torch.multinomial(level_weights, self._batch_n, replacement=True)
+        linear_ramp = (level_index + 1.0) / (level_index + 1.0).sum()
+        squared_ramp = (level_index + 1.0).square()
+        squared_ramp = squared_ramp / squared_ramp.sum()
+        flat_row = torch.zeros((self._n_levels,), dtype=gs.tc_float, device=gs.device)
+        flat_row[0] = 1.0
+        other_level_weights = OTHER_FLAT_ROW_SHARE * flat_row + (1.0 - OTHER_FLAT_ROW_SHARE) * linear_ramp
+        smooth_level_weights = SMOOTH_FLAT_ROW_SHARE * flat_row + (1.0 - SMOOTH_FLAT_ROW_SHARE) * squared_ramp
+        level_weights = other_level_weights.unsqueeze(0).repeat(len(TERRAIN_KINDS), 1)
+        level_weights[TERRAIN_KINDS.index("smooth_slope")] = smooth_level_weights
+        self.terrain_levels = torch.multinomial(level_weights[self.terrain_types], num_samples=1).squeeze(1)
         self._promote_streak = torch.zeros((self._batch_n,), dtype=gs.tc_int, device=gs.device)
         self._obstacle_kind = TERRAIN_KINDS.index("discrete_obstacles")
         self._stair_kind = TERRAIN_KINDS.index("stairs")
