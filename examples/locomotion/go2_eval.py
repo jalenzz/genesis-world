@@ -57,5 +57,6 @@ if __name__ == "__main__":
 
 """
 # evaluation. The log's saved config selects flat ground or the curriculum terrain.
+# A curriculum log whose collision budget is still the flat 20 is widened. An overflow halts instead of respawning.
 python examples/locomotion/go2_eval.py -e go2-walking --ckpt 100
 """

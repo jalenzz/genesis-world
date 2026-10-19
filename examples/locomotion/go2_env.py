@@ -276,6 +276,12 @@ class Go2Env:
             camera_pos = (2.0, 0.0, 2.5)
             camera_lookat = (0.0, 0.0, 0.5)
 
+        # A flat ground fits in 20 pairs. The height field's box covers the whole robot, so every collision geom is a
+        # pair with it and 20 overflows. A pose reset clears that overflow, which hides it.
+        max_collision_pairs = env_cfg.get("max_collision_pairs", 20)
+        if self._terrain_kind == "curriculum" and max_collision_pairs == 20:
+            max_collision_pairs = 256
+
         self.scene = gs.Scene(
             sim_options=gs.options.SimOptions(
                 dt=self.dt,
@@ -283,9 +289,7 @@ class Go2Env:
             ),
             rigid_options=gs.options.RigidOptions(
                 enable_self_collision=False,
-                # A flat ground stays near 20 pairs. A height field meets the feet in more contacts, and the
-                # curriculum config raises this budget. Exceeding it halts the simulation.
-                max_collision_pairs=env_cfg.get("max_collision_pairs", 20),
+                max_collision_pairs=max_collision_pairs,
                 tolerance=1e-5,
                 # Per-environment mass, center of mass and actuator gains need their own copy of those parameters.
                 batch_links_info=self._has_domain_randomization,
@@ -637,10 +641,12 @@ class Go2Env:
         self.reset_buf = self.episode_length_buf > self.max_episode_length
         self.reset_buf |= torch.abs(self.base_euler[:, 1]) > self.env_cfg["termination_if_pitch_greater_than"]
         self.reset_buf |= torch.abs(self.base_euler[:, 0]) > self.env_cfg["termination_if_roll_greater_than"]
+        # A pose reset clears errno. Checking it here is what makes an overflow halt instead of respawning forever.
         error_mask = self.scene.rigid_solver.get_error_envs_mask()
-        if self.num_envs == 0 and error_mask.ndim == 0:
+        if error_mask.ndim == 0:
             error_mask = error_mask.reshape(1)
-        self.reset_buf |= error_mask
+        if bool(error_mask.any()):
+            self.scene.rigid_solver.check_errno()
 
         # Compute timeout
         self.extras["time_outs"] = (self.episode_length_buf > self.max_episode_length).to(dtype=gs.tc_float)

@@ -549,3 +549,66 @@ def test_curriculum_terrain_tracking(n_envs, show_viewer):
     assert (ratio < 1.1 / 0.9).all()
     if n_envs > 0:
         assert ((mass_after[0] - mass_after[1]).abs() > 1e-3).any()
+
+
+@pytest.mark.parametrize("n_envs", [0, 2])
+def test_curriculum_action_reaches_joints(n_envs, show_viewer):
+    env_cfg, obs_cfg, reward_cfg, command_cfg = go2_locomotion_env.locomotion_cfgs()
+    go2_locomotion_env.apply_curriculum(env_cfg, reward_cfg)
+    subterrain_size = (4.0, 4.0)
+    env_cfg["episode_length_s"] = 20.0
+    env_cfg["termination_if_roll_greater_than"] = 180
+    env_cfg["termination_if_pitch_greater_than"] = 180
+    env_cfg["terrain_subterrain_size"] = subterrain_size
+    env_cfg["terrain_horizontal_scale"] = 0.5
+    env_cfg["terrain_vertical_scale"] = 0.01
+    env_cfg["max_collision_pairs"] = 2
+    env_cfg["randomization"] = dict(
+        friction=(1.0, 1.0),
+        mass_scale=(1.0, 1.0),
+        com_offset=0.0,
+        inertia_scale=(1.0, 1.0),
+        gain_scale=(1.0, 1.0),
+        force_scale=(1.0, 1.0),
+        gravity_scale=(1.0, 1.0),
+        push_xy=0.0,
+        push_z=0.0,
+    )
+    command_cfg["lin_vel_x_range"] = [0.0, 0.0]
+    command_cfg["lin_vel_y_range"] = [0.0, 0.0]
+    command_cfg["ang_vel_range"] = [0.0, 0.0]
+    batch_n = n_envs if n_envs > 0 else 1
+    held = torch.zeros((batch_n, env_cfg["num_actions"]), dtype=gs.tc_float, device=gs.device)
+    overflow = go2_locomotion_env.Go2Env(
+        num_envs=n_envs,
+        env_cfg=env_cfg,
+        obs_cfg=obs_cfg,
+        reward_cfg=reward_cfg,
+        command_cfg=command_cfg,
+        show_viewer=show_viewer,
+    )
+    with pytest.raises(gs.GenesisException, match="Exceeding max number"):
+        overflow.step(held)
+    overflow.scene.destroy()
+
+    env_cfg["max_collision_pairs"] = 20
+    env = go2_locomotion_env.Go2Env(
+        num_envs=n_envs,
+        env_cfg=env_cfg,
+        obs_cfg=obs_cfg,
+        reward_cfg=reward_cfg,
+        command_cfg=command_cfg,
+        show_viewer=show_viewer,
+    )
+    assert env.scene.rigid_solver.max_collision_pairs == 256
+    # The first step still executes a zero action. The next one must execute this action on the spawn cell.
+    env.step(held)
+    held_dof = env.robot.get_dofs_position().clone()
+    env.step(torch.ones_like(held))
+    assert (env.episode_length_buf == 2).all()
+    assert not bool(env.reset_buf.any())
+    assert (env.robot.get_dofs_position() - held_dof).abs().max() > 1e-3
+    qpos = env.robot.get_qpos()
+    spawn_x = 0.5 * subterrain_size[0]
+    spawn_xs = qpos[0] if n_envs == 0 else qpos[:, 0]
+    assert ((spawn_xs - spawn_x).abs() < 0.5).all()
