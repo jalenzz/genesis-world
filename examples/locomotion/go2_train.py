@@ -76,6 +76,7 @@ def main():
     )
     parser.add_argument("-b", "--num-envs", type=int, default=4096, help="Number of parallel environments")
     parser.add_argument("--max-iterations", type=int, default=101, help="Number of learning iterations")
+    parser.add_argument("--resume", type=str, default="", help="Checkpoint to load. Learning continues after it.")
     parser.add_argument("--seed", type=int, default=1, help="Random seed")
     parser.add_argument(
         "--terrain",
@@ -110,6 +111,10 @@ def main():
 
     runner_cls = DreamWaQRunner if env_cfg.get("estimator") == "cenet" else OnPolicyRunner
     runner = runner_cls(env, train_cfg, log_dir, device=gs.device)
+    if args.resume:
+        runner.load(args.resume)
+        # The file stores the iteration just finished. The learning loop starts at that index.
+        runner.current_learning_iteration += 1
 
     runner.learn(num_learning_iterations=args.max_iterations, init_at_random_ep_len=True)
 
