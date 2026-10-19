@@ -729,9 +729,11 @@ class Go2Env:
             # The latent has no measured value. Zero is the mean of its standard normal prior.
             latent = torch.zeros((self._batch_n, LATENT_DIM), dtype=gs.tc_float, device=gs.device)
             return self.base_lin_vel, latent
-        belief = self._cenet.encode(self._history)
+        # The history can be an inference tensor from the rollout. Autograd has to save a normal tensor.
+        history = self._history.detach().clone()
+        belief = self._cenet.encode(history)
         latent = self._cenet.reparameterize(belief) if self._is_latent_sampled else belief.mean
-        return belief.velocity, latent
+        return belief.velocity.detach(), latent.detach()
 
     def set_estimator_ground_truth(self, use_ground_truth):
         """Choose measured velocity or the estimator for the actor, including the observation already published."""
@@ -762,9 +764,10 @@ class Go2Env:
         """
         if self._cenet is None:
             return 0.0
-        history = storage.observations["history"][:-1]
-        next_proprio = storage.observations["proprio"][1:]
-        velocity = storage.observations["lin_vel"][:-1]
+        # Clones leave inference tensors from the rollout. The loss gradient stays on the estimator parameters.
+        history = storage.observations["history"][:-1].detach().clone()
+        next_proprio = storage.observations["proprio"][1:].detach().clone()
+        velocity = storage.observations["lin_vel"][:-1].detach().clone()
         alive = storage.dones[:-1].squeeze(-1) == 0
         if not bool(alive.any()):
             return 0.0
@@ -879,7 +882,10 @@ class Go2Env:
         # Filling the whole window drops the previous episode. A roll would leave it in the encoder's context.
         # The reset mask is allocated as gs.tc_bool, an integer on Metal, and where requires a boolean condition.
         is_resetting = self.reset_buf[:, None, None] != 0
-        self._history = torch.where(is_resetting, filled, rolled)
+        updated = torch.where(is_resetting, filled, rolled)
+        # Rollout steps run in inference mode and mark this result. The clone below is a normal tensor.
+        with torch.inference_mode(False):
+            self._history = updated.detach().clone()
 
     def reset(self):
         self._reset_idx()

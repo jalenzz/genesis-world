@@ -1,7 +1,9 @@
 import importlib.util
+import math
 import os
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import igl
 import numpy as np
@@ -658,6 +660,39 @@ def test_proprio_history_fills_from_integer_reset_mask():
     assert_equal(env._history[0], env.obs_buf[0].expand(HISTORY_STEPS, proprio_dim))
     assert_equal(env._history[1, :-1], torch.full((HISTORY_STEPS - 1, proprio_dim), -1.0))
     assert_equal(env._history[1, -1], env.obs_buf[1])
+
+
+def test_estimator_backward_from_inference_history():
+    batch = 2
+    steps = 3
+    proprio_dim = 45
+    env = go2_locomotion_env.Go2Env.__new__(go2_locomotion_env.Go2Env)
+    env._batch_n = batch
+    env._is_latent_sampled = False
+    env._cenet = CENet(proprio_dim)
+    env._cenet_optimizer = torch.optim.Adam(env._cenet.parameters(), lr=1.0e-3)
+    with torch.inference_mode():
+        env._history = torch.randn(batch, HISTORY_STEPS, proprio_dim)
+        history = torch.randn(steps, batch, HISTORY_STEPS, proprio_dim)
+        proprio = torch.randn(steps, batch, proprio_dim)
+        velocity = torch.randn(steps, batch, 3)
+        dones = torch.zeros(steps, batch, 1)
+    env._published_observations = {}
+    env.set_estimator_ground_truth(False)
+    assert env._published_observations["est_vel"].shape == (batch, 3)
+    assert env._published_observations["latent"].shape == (batch, LATENT_DIM)
+    assert not env._published_observations["est_vel"].is_inference()
+
+    storage = SimpleNamespace(
+        observations={"history": history, "proprio": proprio, "lin_vel": velocity},
+        dones=dones,
+    )
+    loss = env.update_estimator(storage)
+    assert math.isfinite(loss)
+    assert env._cenet.encoder[0].weight.grad is not None
+    assert env._cenet.encoder[0].weight.grad.abs().sum() > 0
+    assert history.grad is None
+    assert not history.requires_grad
 
 
 def test_cenet_belief_and_actor_groups():
