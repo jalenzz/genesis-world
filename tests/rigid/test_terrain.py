@@ -14,7 +14,7 @@ import genesis.utils.geom as gu
 import genesis.utils.terrain as tu
 from genesis.utils.misc import get_assets_dir, tensor_to_array
 
-from ..utils.assertions import assert_allclose
+from ..utils.assertions import assert_allclose, assert_equal
 
 _LOCOMOTION_DIR = Path(__file__).resolve().parents[2] / "examples" / "locomotion"
 sys.path.insert(0, str(_LOCOMOTION_DIR))
@@ -634,6 +634,30 @@ def test_curriculum_action_reaches_joints(n_envs, show_viewer):
     spawn_x = 0.5 * subterrain_size[0]
     spawn_xs = qpos[0] if n_envs == 0 else qpos[:, 0]
     assert ((spawn_xs - spawn_x).abs() < 0.5).all()
+
+
+def test_proprio_history_fills_from_integer_reset_mask():
+    batch = 2
+    proprio_dim = 45
+    env = go2_locomotion_env.Go2Env.__new__(go2_locomotion_env.Go2Env)
+    env._cenet = object()
+    env._proprio_dim = proprio_dim
+    env.obs_scales = {"ang_vel": 0.25, "dof_pos": 1.0, "dof_vel": 0.05}
+    env.base_ang_vel = torch.zeros(batch, 3)
+    env.projected_gravity = torch.zeros(batch, 3)
+    env.projected_gravity[:, 2] = -1.0
+    env.commands = torch.zeros(batch, 3)
+    env.commands_scale = torch.ones(3)
+    env.dof_pos = torch.zeros(batch, 12)
+    env.default_dof_pos = torch.zeros(12)
+    env.dof_vel = torch.zeros(batch, 12)
+    env.actions = torch.arange(batch * 12, dtype=gs.tc_float).reshape(batch, 12)
+    env._history = torch.full((batch, HISTORY_STEPS, proprio_dim), -1.0)
+    env.reset_buf = torch.tensor([1, 0], dtype=gs.tc_int)
+    env._update_observation()
+    assert_equal(env._history[0], env.obs_buf[0].expand(HISTORY_STEPS, proprio_dim))
+    assert_equal(env._history[1, :-1], torch.full((HISTORY_STEPS - 1, proprio_dim), -1.0))
+    assert_equal(env._history[1, -1], env.obs_buf[1])
 
 
 def test_cenet_belief_and_actor_groups():

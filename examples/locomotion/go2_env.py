@@ -877,7 +877,9 @@ class Go2Env:
         rolled[:, -1] = self.obs_buf
         filled = self.obs_buf[:, None, :].expand_as(self._history)
         # Filling the whole window drops the previous episode. A roll would leave it in the encoder's context.
-        self._history = torch.where(self.reset_buf[:, None, None], filled, rolled)
+        # The reset mask is allocated as gs.tc_bool, an integer on Metal, and where requires a boolean condition.
+        is_resetting = self.reset_buf[:, None, None] != 0
+        self._history = torch.where(is_resetting, filled, rolled)
 
     def reset(self):
         self._reset_idx()
