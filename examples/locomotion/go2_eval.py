@@ -1,9 +1,17 @@
 import argparse
 import os
 import pickle
+import time
 from importlib import metadata
 
-os.environ.setdefault("PYGAME_HIDE_SUPPORT_PROMPT", "1")
+# com.apple.gamecontroller.driver.XboxGamepad owns the Microsoft pad (vid 1118, pid 2834), so the
+# HIDAPI backend stays at 0. SDL then exposes the IOKit device, and only while a Cocoa window exists.
+os.environ["PYGAME_HIDE_SUPPORT_PROMPT"] = "1"
+os.environ["SDL_JOYSTICK_ALLOW_BACKGROUND_EVENTS"] = "1"
+os.environ["SDL_JOYSTICK_HIDAPI"] = "0"
+os.environ["SDL_JOYSTICK_HIDAPI_XBOX"] = "0"
+os.environ["SDL_JOYSTICK_HIDAPI_XBOX_ONE"] = "0"
+os.environ["SDL_JOYSTICK_MFI"] = "1"
 
 import pygame
 import torch
@@ -23,10 +31,12 @@ from go2_env import TERRAIN_KINDS, Go2Env
 
 # Resting Xbox sticks sit a little off center. Inside this band the command is 0.
 STICK_DEADZONE = 0.15
-# pygame axis indices for this pad. SDL names them leftx, lefty, and rightx.
+# IOKit axis order: 0 left X, 1 left Y, 2 left trigger, 3 right X, 4 right Y, 5 right trigger.
 LEFT_STICK_X = 0
 LEFT_STICK_Y = 1
-RIGHT_STICK_X = 2
+RIGHT_STICK_X = 3
+# Held for the teleop run. The IOKit pad enumerates only while this Cocoa window is open.
+_pad_window = None
 
 
 def _load_cfgs(exp_name):
@@ -242,15 +252,19 @@ def run_metrics(args):
 
 
 def _open_pad():
-    """Open the first joystick pygame enumerates, or return None when no pad is connected."""
-    # A dummy video driver keeps pygame from opening a window beside the viewer.
-    os.environ["SDL_VIDEODRIVER"] = "dummy"
-    os.environ["SDL_JOYSTICK_ALLOW_BACKGROUND_EVENTS"] = "1"
-    if not pygame.display.get_init():
-        pygame.display.init()
-    if not pygame.joystick.get_init():
-        pygame.joystick.init()
+    """Open the Xbox pad through a Cocoa window, or return None when no pad is connected."""
+    global _pad_window
+    pygame.init()
+    _pad_window = pygame.display.set_mode((640, 200))
+    pygame.display.set_caption("xbox stick")
+    pygame.joystick.init()
+    deadline = time.perf_counter() + 3
+    while time.perf_counter() < deadline and pygame.joystick.get_count() < 1:
+        pygame.event.pump()
+        time.sleep(0.05)
     if pygame.joystick.get_count() < 1:
+        _pad_window = None
+        pygame.quit()
         return None
     pad = pygame.joystick.Joystick(0)
     pad.init()
@@ -259,7 +273,7 @@ def _open_pad():
 
 def _stick_command(pad):
     """Return vx, vy, and yaw in [-1, 1]. A stick inside the deadzone contributes 0."""
-    pygame.event.pump()
+    pygame.event.get()
     # SDL reports X to the right and Y downward. vx is forward, vy is left, and yaw is left.
     vx = -pad.get_axis(LEFT_STICK_Y)
     vy = -pad.get_axis(LEFT_STICK_X)
