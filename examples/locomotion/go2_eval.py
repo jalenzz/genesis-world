@@ -24,6 +24,7 @@ except (metadata.PackageNotFoundError, ImportError, ValueError) as e:
 from rsl_rl.runners import OnPolicyRunner
 
 import genesis as gs
+from genesis.utils.geom import transform_by_quat
 from genesis.vis.keybindings import Key, KeyAction, Keybind
 
 from dreamwaq import DreamWaQRunner
@@ -31,6 +32,8 @@ from go2_env import TERRAIN_KINDS, Go2Env
 
 # Resting Xbox sticks sit a little off center. Inside this band the command is 0.
 STICK_DEADZONE = 0.15
+# Chase camera in the base frame. +x is forward, so this sits behind the base and above it.
+CHASE_OFFSET = (-1.5, 0.0, 0.55)
 # IOKit axis order: 0 left X, 1 left Y, 2 left trigger, 3 right X, 4 right Y, 5 right trigger.
 LEFT_STICK_X = 0
 LEFT_STICK_Y = 1
@@ -289,6 +292,12 @@ def _publish_command(env, command):
     return env.get_observations()
 
 
+def _follow_base(env, offset):
+    """Put the viewer behind the base in the base frame and aim it at the base."""
+    pos = env.base_pos[0]
+    env.scene.viewer.set_camera_pose(pos=pos + transform_by_quat(offset, env.base_quat[0]), lookat=pos)
+
+
 def run_teleop(args):
     gs.init(backend=gs.cpu)
 
@@ -337,6 +346,8 @@ def run_teleop(args):
         Keybind("quit", Key.ESCAPE, KeyAction.RELEASE, callback=stop),
         overwrite=True,
     )
+    chase_offset = torch.tensor(CHASE_OFFSET, dtype=gs.tc_float, device=gs.device)
+    _follow_base(env, chase_offset)
 
     runner_cls = DreamWaQRunner if env_cfg.get("estimator") == "cenet" else OnPolicyRunner
     runner = runner_cls(env, train_cfg, log_dir, device=gs.device)
@@ -351,6 +362,7 @@ def run_teleop(args):
     )
 
     obs_dict = env.reset()
+    _follow_base(env, chase_offset)
 
     def command():
         vx = (1.0 if "w" in held_keys else 0.0) - (1.0 if "s" in held_keys else 0.0)
@@ -365,6 +377,7 @@ def run_teleop(args):
     obs_dict = _publish_command(env, command())
     with torch.no_grad():
         while is_running and env.scene.viewer.is_alive():
+            _follow_base(env, chase_offset)
             actions = policy(obs_dict)
             obs_dict, _rews, _dones, _infos = env.step(actions)
             obs_dict = _publish_command(env, command())
