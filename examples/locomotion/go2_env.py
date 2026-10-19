@@ -331,6 +331,8 @@ class Go2Env:
         self._horizontal_scale = env_cfg.get("terrain_horizontal_scale", 0.25)
         self._vertical_scale = env_cfg.get("terrain_vertical_scale", 0.005)
         self._max_slope_deg = env_cfg.get("terrain_max_slope_deg", 22.0)
+        self._terrain_span_x = self._n_levels * self._subterrain_size[0]
+        self._terrain_span_y = len(TERRAIN_KINDS) * self._subterrain_size[1]
 
         if self._terrain_kind == "curriculum":
             span_x = self._n_levels * self._subterrain_size[0]
@@ -574,6 +576,14 @@ class Go2Env:
     def _terrain_z(self, xy):
         if self.terrain is None:
             return torch.zeros(xy.shape[:-1], dtype=gs.tc_float, device=gs.device)
+        # A point more than one cell past the height field comes back as NaN and poisons the height rewards.
+        xy = torch.stack(
+            (
+                xy[..., 0].clamp(0.0, self._terrain_span_x),
+                xy[..., 1].clamp(0.0, self._terrain_span_y),
+            ),
+            dim=-1,
+        )
         if self.num_envs == 0:
             return self.terrain.get_terrain_height(xy[0]).unsqueeze(0)
         if xy.ndim == 2:
