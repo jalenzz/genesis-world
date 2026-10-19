@@ -729,11 +729,41 @@ def test_cenet_belief_and_actor_groups():
     assert adaboot_uses_truth(varied_returns, torch.zeros(()))
     assert not adaboot_uses_truth(varied_returns, torch.ones(()))
 
-    env_cfg, _, reward_cfg, _ = go2_locomotion_env.locomotion_cfgs()
+    env_cfg, _, reward_cfg, command_cfg = go2_locomotion_env.locomotion_cfgs()
+    assert reward_cfg["reward_scales"]["tracking_ang_vel"] == 0.2
+    assert reward_cfg["reward_scales"]["similar_to_default"] == -0.1
+    assert command_cfg["lin_vel_x_range"] == [0.5, 0.5]
     flat_groups = go2_locomotion_env.policy_obs_groups(env_cfg)
     assert flat_groups["actor"] == ["policy"]
     assert flat_groups["critic"] == ["policy"]
-    go2_locomotion_env.apply_curriculum(env_cfg, reward_cfg)
+    go2_locomotion_env.apply_curriculum(env_cfg, reward_cfg, command_cfg)
+    scales = reward_cfg["reward_scales"]
+    assert scales["tracking_lin_vel"] == 1.0
+    assert scales["tracking_ang_vel"] == 0.5
+    assert scales["lin_vel_z"] == -2.0
+    assert scales["ang_vel_xy"] == -0.05
+    assert scales["orientation"] == -0.2
+    assert scales["dof_acc"] == -2.5e-7
+    assert scales["joint_power"] == -2.0e-5
+    assert scales["base_height"] == -1.0
+    assert scales["feet_clearance"] == -0.01
+    assert scales["action_rate"] == -0.01
+    assert scales["action_smoothness"] == -0.01
+    assert scales["power_distribution"] == -1.0e-5
+    assert "feet_air_time" not in scales
+    assert "similar_to_default" not in scales
+    assert command_cfg["lin_vel_x_range"] == [-1.0, 1.0]
+    assert command_cfg["lin_vel_y_range"] == [-1.0, 1.0]
+    assert command_cfg["ang_vel_range"] == [-1.0, 1.0]
+    randomization = env_cfg["randomization"]
+    assert randomization["payload"] == (-1.0, 2.0)
+    assert randomization["friction_coefficient"] == (0.2, 1.25)
+    assert randomization["gain_scale"] == (0.9, 1.1)
+    assert randomization["force_scale"] == (0.9, 1.1)
+    assert randomization["com_offset"] == 0.05
+    assert randomization["system_delay"] == (0.0, 0.015)
+    assert randomization["mass_scale"] == (1.0, 1.0)
+    assert randomization["push_xy"] == 0.0
     dream_groups = go2_locomotion_env.policy_obs_groups(env_cfg)
     assert dream_groups["actor"] == ["proprio", "est_vel", "latent"]
     assert dream_groups["critic"] == ["proprio", "lin_vel", "disturbance"]

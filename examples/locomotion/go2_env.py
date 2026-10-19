@@ -37,6 +37,12 @@ class DomainRandomization(NamedTuple):
     gravity_scale: tuple[float, float]
     push_xy: float
     push_z: float
+    # Added mass on the base, in kilograms. (0, 0) leaves the mass scale as the only mass change.
+    payload: tuple[float, float] = (0.0, 0.0)
+    # Extra delay inside the control period, in seconds. (0, 0) keeps the one-step position target.
+    system_delay: tuple[float, float] = (0.0, 0.0)
+    # Absolute friction coefficient. None keeps `friction` as a ratio of the authored coefficient.
+    friction_coefficient: tuple[float, float] | None = None
 
 
 DEFAULT_RANDOMIZATION = DomainRandomization(
@@ -129,10 +135,11 @@ def locomotion_cfgs():
 
 
 def curriculum_reward_scales():
-    """Return reward weights for velocity tracking on the terrain curriculum.
+    """Return the per-step reward weights of the terrain curriculum.
 
-    Tracking stays the dominant term. Joint acceleration and motor power are large signals, so their weights stay
-    small. Height is measured above the terrain, and a heavy height penalty fights the slope, so that weight is light.
+    Each weight multiplies its term once per control step. Linear and yaw tracking are exponentials of the squared
+    velocity error. The remaining terms penalize vertical and roll-pitch velocity, body tilt, joint acceleration,
+    motor power, body height, foot clearance, action changes, and uneven motor power.
     """
     return {
         "tracking_lin_vel": 1.0,
@@ -143,7 +150,6 @@ def curriculum_reward_scales():
         "dof_acc": -2.5e-7,
         "joint_power": -2.0e-5,
         "base_height": -1.0,
-        "feet_air_time": 1.0,
         "feet_clearance": -0.01,
         "action_rate": -0.01,
         "action_smoothness": -0.01,
@@ -173,18 +179,36 @@ def policy_obs_groups(env_cfg):
     return {"actor": ["policy"], "critic": ["policy"]}
 
 
-def apply_curriculum(env_cfg, reward_cfg):
-    """Point a walking config at the terrain curriculum and its reward weights.
+def apply_curriculum(env_cfg, reward_cfg, command_cfg=None):
+    """Point a walking config at the terrain curriculum, its rewards, and its domain randomization.
 
     The flat-ground entry leaves these fields unset. A height field produces more foot contacts than a plane, so the
     collision budget is raised with the terrain. The curriculum actor reads an estimated base velocity, so the context
-    estimator is enabled here and stays off for the flat walker.
+    estimator is enabled here. When a command config is passed, linear and yaw commands are drawn from [-1, 1].
     """
     env_cfg["terrain"] = "curriculum"
     env_cfg["domain_randomization"] = True
     env_cfg["max_collision_pairs"] = 256
     env_cfg["estimator"] = "cenet"
+    env_cfg["randomization"] = {
+        "friction": (1.0, 1.0),
+        "mass_scale": (1.0, 1.0),
+        "com_offset": 0.05,
+        "inertia_scale": (1.0, 1.0),
+        "gain_scale": (0.9, 1.1),
+        "force_scale": (0.9, 1.1),
+        "gravity_scale": (1.0, 1.0),
+        "push_xy": 0.0,
+        "push_z": 0.0,
+        "payload": (-1.0, 2.0),
+        "system_delay": (0.0, 0.015),
+        "friction_coefficient": (0.2, 1.25),
+    }
     reward_cfg["reward_scales"] = curriculum_reward_scales()
+    if command_cfg is not None:
+        command_cfg["lin_vel_x_range"] = [-1.0, 1.0]
+        command_cfg["lin_vel_y_range"] = [-1.0, 1.0]
+        command_cfg["ang_vel_range"] = [-1.0, 1.0]
 
 
 def build_curriculum_height_field(n_levels, subterrain_size, horizontal_scale, vertical_scale, max_slope_deg):
@@ -357,7 +381,7 @@ class Go2Env:
 
         # The foot is a fixed child of the calf, so the loader folds it into the calf. Clearance and foot contact
         # read that sphere as its own link, which means naming it here. The flat-ground rewards never read it.
-        needs_feet = "feet_air_time" in self.reward_scales or "feet_clearance" in self.reward_scales
+        needs_feet = "feet_clearance" in self.reward_scales
         self.robot = self.scene.add_entity(
             gs.morphs.URDF(
                 file="urdf/go2/urdf/go2.urdf",
@@ -409,6 +433,14 @@ class Go2Env:
             force_lower, force_upper = self.robot.get_dofs_force_range(self.motors_dof_idx)
             self._nominal_force_lower = self._shared_nominal(force_lower)
             self._nominal_force_upper = self._shared_nominal(force_upper)
+            if self._randomization.friction_coefficient is not None:
+                frictions = []
+                for link in self.robot.links:
+                    if link.geoms:
+                        frictions.append(link.geoms[0].get_friction())
+                    else:
+                        frictions.append(torch.ones((), dtype=gs.tc_float, device=gs.device))
+                self._nominal_friction = torch.stack(frictions)
 
         # initialize buffers
         self.base_lin_vel = torch.empty((self._batch_n, 3), dtype=gs.tc_float, device=gs.device)
@@ -449,8 +481,8 @@ class Go2Env:
         self.terrain_levels = torch.zeros((self._batch_n,), dtype=gs.tc_int, device=gs.device)
         self.terrain_types = torch.arange(self._batch_n, device=gs.device) % len(TERRAIN_KINDS)
         self.episode_tracking_lin = torch.zeros((self._batch_n,), dtype=gs.tc_float, device=gs.device)
-        self._feet_air_time = torch.zeros((self._batch_n, len(FOOT_LINK_NAMES)), dtype=gs.tc_float, device=gs.device)
         self._push_force = torch.zeros((self._batch_n, 3), dtype=gs.tc_float, device=gs.device)
+        self._action_delay = torch.zeros((self._batch_n,), dtype=gs.tc_float, device=gs.device)
         self._cenet = None
         self._cenet_optimizer = None
         self._finished_returns = []
@@ -467,8 +499,8 @@ class Go2Env:
             self._episode_return = torch.zeros((self._batch_n,), dtype=gs.tc_float, device=gs.device)
         self._feet_pos = None
         self._feet_vel = None
-        self._feet_contact = None
         self._dof_acc = None
+        self._motor_torque = None
         self._motor_power = None
 
         reward_fns = {
@@ -480,17 +512,18 @@ class Go2Env:
             "dof_acc": self._reward_dof_acc,
             "joint_power": self._reward_joint_power,
             "base_height": self._reward_base_height,
-            "feet_air_time": self._reward_feet_air_time,
             "feet_clearance": self._reward_feet_clearance,
             "action_rate": self._reward_action_rate,
             "action_smoothness": self._reward_action_smoothness,
             "power_distribution": self._reward_power_distribution,
             "similar_to_default": self._reward_similar_to_default,
         }
-        # prepare reward functions and multiply reward scales by dt
+        # The flat walker folds the control period into each weight. Curriculum weights are the per-step multipliers.
+        scale_by_dt = self._terrain_kind != "curriculum"
         self.reward_functions, self.episode_sums = dict(), dict()
         for name in self.reward_scales.keys():
-            self.reward_scales[name] *= self.dt
+            if scale_by_dt:
+                self.reward_scales[name] *= self.dt
             self.reward_functions[name] = reward_fns[name]
             self.episode_sums[name] = torch.zeros((self._batch_n,), dtype=gs.tc_float, device=gs.device)
 
@@ -570,10 +603,22 @@ class Go2Env:
         ranges = self._randomization
         link_shape = (n_links,) if self.num_envs == 0 else (count, n_links)
         dof_shape = (self.num_actions,) if self.num_envs == 0 else (count, self.num_actions)
-        friction = self._sample_interval(*ranges.friction, link_shape)
+        if ranges.friction_coefficient is None:
+            friction = self._sample_interval(*ranges.friction, link_shape)
+        else:
+            # The setter scales the authored coefficient, so an absolute coefficient becomes that ratio.
+            coefficient = self._sample_interval(*ranges.friction_coefficient, link_shape)
+            friction = coefficient / self._nominal_friction
         self.robot.set_friction_ratio(friction, envs_idx=env_ids)
         mass_scale = self._sample_interval(*ranges.mass_scale, link_shape)
-        self.robot.set_links_mass(self._nominal_mass * mass_scale, envs_idx=env_ids)
+        mass = self._nominal_mass * mass_scale
+        payload = self._sample_interval(*ranges.payload, (count,) if self.num_envs > 0 else ())
+        base_local = self._base_link.idx_local
+        if self.num_envs == 0:
+            mass[base_local] = mass[base_local] + payload
+        else:
+            mass[:, base_local] = mass[:, base_local] + payload
+        self.robot.set_links_mass(mass, envs_idx=env_ids)
         if self.num_envs == 0:
             com_offset = (torch.rand((n_links, 3), dtype=gs.tc_float, device=gs.device) * 2.0 - 1.0) * ranges.com_offset
             inertia_scale = self._sample_interval(*ranges.inertia_scale, (n_links, 1, 1))
@@ -605,6 +650,11 @@ class Go2Env:
             self._push_force.copy_(push)
         else:
             self._push_force[env_ids] = push
+        delay = self._sample_interval(*ranges.system_delay, (count,))
+        if env_ids is None:
+            self._action_delay.copy_(delay)
+        else:
+            self._action_delay[env_ids] = delay
 
     def _apply_push(self):
         if not self._has_domain_randomization:
@@ -629,22 +679,23 @@ class Go2Env:
             torch.where(envs_idx[:, None], commands, self.commands, out=self.commands)
 
     def _read_feet_and_motors(self):
-        needs_feet = "feet_air_time" in self.reward_functions or "feet_clearance" in self.reward_functions
+        needs_feet = "feet_clearance" in self.reward_functions
         if needs_feet:
             self._feet_pos = self._batch(self.robot.get_links_pos(self._feet_idx))
             self._feet_vel = self._batch(self.robot.get_links_vel(self._feet_idx))
-            contact_force = self._batch(self.robot.get_links_net_contact_force())
-            # A foot is on the ground once the contact force exceeds a newton, above numerical noise.
-            self._feet_contact = torch.linalg.norm(contact_force[:, self._feet_idx], dim=-1) > 1.0
         if "dof_acc" in self.reward_functions:
             self._dof_acc = self._batch(self.robot.get_dofs_acc(self.motors_dof_idx))
         if "joint_power" in self.reward_functions or "power_distribution" in self.reward_functions:
-            torque = self._batch(self.robot.get_dofs_control_force(self.motors_dof_idx))
-            self._motor_power = torch.abs(torque) * torch.abs(self.dof_vel)
+            self._motor_torque = self._batch(self.robot.get_dofs_control_force(self.motors_dof_idx))
+            self._motor_power = torch.abs(self._motor_torque) * torch.abs(self.dof_vel)
 
     def step(self, actions):
         self.actions = torch.clip(actions, -self.env_cfg["clip_actions"], self.env_cfg["clip_actions"])
         exec_actions = self.last_actions if self.simulate_action_latency else self.actions
+        # A delay shorter than the control period blends the one-step target toward the target before it.
+        if self._has_domain_randomization and bool((self._action_delay > 0).any()):
+            alpha = (self._action_delay / self.dt).clamp(0.0, 1.0).unsqueeze(-1)
+            exec_actions = (1.0 - alpha) * self.last_actions + alpha * self.last_last_actions
         target_dof_pos = exec_actions * self.env_cfg["action_scale"] + self.default_dof_pos
         ordered = target_dof_pos[:, self.actions_dof_idx]
         self._apply_push()
@@ -813,7 +864,6 @@ class Go2Env:
             self.last_last_actions.zero_()
             self.episode_length_buf.zero_()
             self.episode_tracking_lin.zero_()
-            self._feet_air_time.zero_()
             self.reset_buf.fill_(True)
             if self._cenet is not None:
                 self._episode_return.zero_()
@@ -832,7 +882,6 @@ class Go2Env:
             self.last_last_actions.masked_fill_(envs_idx[:, None], 0.0)
             self.episode_length_buf.masked_fill_(envs_idx, 0)
             self.episode_tracking_lin.masked_fill_(envs_idx, 0.0)
-            self._feet_air_time.masked_fill_(envs_idx[:, None], 0.0)
             self.reset_buf.masked_fill_(envs_idx, True)
             if self._cenet is not None:
                 self._episode_return.masked_fill_(envs_idx, 0.0)
@@ -912,8 +961,8 @@ class Go2Env:
         return torch.sum(torch.square(self.base_ang_vel[:, :2]), dim=1)
 
     def _reward_orientation(self):
-        # Penalize torso tilt away from upright
-        return torch.sum(torch.square(self.projected_gravity[:, :2]), dim=1)
+        # Penalize the squared norm of gravity in the body frame
+        return torch.sum(torch.square(self.projected_gravity), dim=1)
 
     def _reward_dof_acc(self):
         # Penalize joint acceleration
@@ -940,16 +989,6 @@ class Go2Env:
         height = self.base_pos[:, 2] - self._terrain_z(self.base_pos[:, :2])
         return torch.square(height - self.reward_cfg["base_height_target"])
 
-    def _reward_feet_air_time(self):
-        # Pay the swing duration once, on the landing step. A foot that stays down has a cleared timer.
-        contact = self._feet_contact
-        first_contact = contact & (self._feet_air_time > 0)
-        self._feet_air_time += self.dt
-        rew = torch.sum((self._feet_air_time - 0.5) * first_contact, dim=1)
-        self._feet_air_time *= ~contact
-        moving = torch.linalg.norm(self.commands[:, :2], dim=1) > 0.1
-        return torch.where(moving, rew, torch.zeros_like(rew))
-
     def _reward_feet_clearance(self):
         # Penalize swing feet whose height above the terrain misses the clearance target. Stance speed is ~0.
         clearance = self._feet_pos[..., 2] - self._terrain_z(self._feet_pos[..., :2])
@@ -957,5 +996,6 @@ class Go2Env:
         return torch.sum(torch.square(clearance - self.reward_cfg["feet_height_target"]) * speed, dim=1)
 
     def _reward_power_distribution(self):
-        # Penalize uneven mechanical power across the motors
-        return torch.var(self._motor_power, dim=1)
+        # Penalize the square of the variance of signed joint power across the motors
+        signed_power = self._motor_torque * self.dof_vel
+        return torch.square(torch.var(signed_power, dim=1, unbiased=False))

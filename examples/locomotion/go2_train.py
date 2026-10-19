@@ -91,7 +91,7 @@ def main():
     log_dir = f"logs/{args.exp_name}"
     env_cfg, obs_cfg, reward_cfg, command_cfg = locomotion_cfgs()
     if args.terrain == "curriculum":
-        apply_curriculum(env_cfg, reward_cfg)
+        apply_curriculum(env_cfg, reward_cfg, command_cfg)
     train_cfg = configure_train_cfg(args.exp_name, env_cfg)
 
     if os.path.exists(log_dir):
