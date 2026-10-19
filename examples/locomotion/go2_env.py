@@ -25,6 +25,17 @@ def gs_rand(lower, upper, batch_shape):
 
 # Columns of the curriculum grid, in order. Rows are the difficulty levels.
 TERRAIN_KINDS = ("smooth_slope", "rough_slope", "discrete_obstacles", "stairs")
+# Obstacles and stairs are listed twice so those columns receive twice the episodes of one slope column.
+TERRAIN_PRACTICE = (
+    TERRAIN_KINDS.index("smooth_slope"),
+    TERRAIN_KINDS.index("rough_slope"),
+    TERRAIN_KINDS.index("discrete_obstacles"),
+    TERRAIN_KINDS.index("discrete_obstacles"),
+    TERRAIN_KINDS.index("stairs"),
+    TERRAIN_KINDS.index("stairs"),
+)
+# Consecutive episodes above the tracking bar before an obstacle or stair row may rise.
+SLOW_PROMOTE_EPISODES = 2
 
 
 class DomainRandomization(NamedTuple):
@@ -214,9 +225,11 @@ def apply_curriculum(env_cfg, reward_cfg, command_cfg=None):
 def build_curriculum_height_field(n_levels, subterrain_size, horizontal_scale, vertical_scale, max_slope_deg):
     """Build the height field of the tracking curriculum.
 
-    Each row is one difficulty, with slope angle `row / (n_levels - 1) * max_slope_deg`. The columns are a smooth
-    pyramid slope, the same slope plus height noise, discrete obstacles, and pyramid stairs. The value at each grid
-    point is the discrete height the terrain morph scales by `vertical_scale`.
+    Each row is one difficulty. Smooth and rough slopes use angle `row / (n_levels - 1) * max_slope_deg`. Discrete
+    obstacles and stairs use the square of that fraction, so early rows stay near flat and the last row still reaches
+    the full obstacle height and the same slope. The columns are a smooth pyramid slope, the same slope plus height
+    noise, discrete obstacles, and pyramid stairs. The value at each grid point is the discrete height the terrain
+    morph scales by `vertical_scale`.
     """
     n_types = len(TERRAIN_KINDS)
     subterrain_rows = int(subterrain_size[0] / horizontal_scale + gs.EPS) + 1
@@ -237,6 +250,8 @@ def build_curriculum_height_field(n_levels, subterrain_size, horizontal_scale, v
         for level in range(n_levels):
             difficulty = level / (n_levels - 1)
             slope = math.tan(math.radians(max_slope_deg * difficulty))
+            eased = difficulty * difficulty
+            eased_slope = math.tan(math.radians(max_slope_deg * eased))
             for kind in range(n_types):
                 np.random.seed(level * n_types + kind)
                 tile = SubTerrain(
@@ -261,7 +276,7 @@ def build_curriculum_height_field(n_levels, subterrain_size, horizontal_scale, v
                 elif kind == 2:
                     discrete_obstacles_terrain(
                         tile,
-                        max_height=0.02 + 0.18 * difficulty,
+                        max_height=0.20 * eased,
                         min_size=min_obstacle,
                         max_size=max_obstacle,
                         num_rects=8,
@@ -271,7 +286,7 @@ def build_curriculum_height_field(n_levels, subterrain_size, horizontal_scale, v
                     pyramid_stairs_terrain(
                         tile,
                         step_width=step_width,
-                        step_height=slope * step_width,
+                        step_height=eased_slope * step_width,
                         platform_size=platform,
                     )
                 row0 = level * (subterrain_rows - 1)
@@ -479,7 +494,11 @@ class Go2Env:
         )
         self.extras = dict()  # extra information for logging
         self.terrain_levels = torch.zeros((self._batch_n,), dtype=gs.tc_int, device=gs.device)
-        self.terrain_types = torch.arange(self._batch_n, device=gs.device) % len(TERRAIN_KINDS)
+        practice = torch.tensor(TERRAIN_PRACTICE, dtype=gs.tc_int, device=gs.device)
+        self.terrain_types = practice[torch.arange(self._batch_n, device=gs.device) % practice.shape[0]]
+        self._promote_streak = torch.zeros((self._batch_n,), dtype=gs.tc_int, device=gs.device)
+        self._obstacle_kind = TERRAIN_KINDS.index("discrete_obstacles")
+        self._stair_kind = TERRAIN_KINDS.index("stairs")
         self.episode_tracking_lin = torch.zeros((self._batch_n,), dtype=gs.tc_float, device=gs.device)
         self._push_force = torch.zeros((self._batch_n, 3), dtype=gs.tc_float, device=gs.device)
         self._action_delay = torch.zeros((self._batch_n,), dtype=gs.tc_float, device=gs.device)
@@ -572,12 +591,22 @@ class Go2Env:
     def _update_terrain_curriculum(self, envs_idx):
         if self.terrain is None:
             return
-        # The tracking reward saturates at 1. The level rises above the upper fraction and falls below the lower one.
+        # The tracking reward saturates at 1. A slope row rises above the upper fraction and falls below the lower one.
+        # Obstacles and stairs rise only after consecutive episodes above the bar, and fall once tracking is below it.
         finished = self._reset_mask(envs_idx) & (self.episode_length_buf > 0)
         mean_tracking = self.episode_tracking_lin / self.episode_length_buf.clamp(min=1)
-        delta = (mean_tracking > self._curriculum_up).to(dtype=gs.tc_int)
-        delta = delta - (mean_tracking < self._curriculum_down).to(dtype=gs.tc_int)
-        self.terrain_levels += torch.where(finished, delta, torch.zeros_like(delta))
+        is_up = mean_tracking > self._curriculum_up
+        is_down = mean_tracking < self._curriculum_down
+        is_slow = (self.terrain_types == self._obstacle_kind) | (self.terrain_types == self._stair_kind)
+        slope_delta = is_up.to(dtype=gs.tc_int) - is_down.to(dtype=gs.tc_int)
+        streak = torch.where(finished & is_slow & is_up, self._promote_streak + 1, self._promote_streak)
+        streak = torch.where(finished & is_slow & ~is_up, torch.zeros_like(streak), streak)
+        is_slow_promote = finished & is_slow & (streak >= SLOW_PROMOTE_EPISODES)
+        streak = torch.where(is_slow_promote, torch.zeros_like(streak), streak)
+        slow_delta = is_slow_promote.to(dtype=gs.tc_int) - (finished & is_slow & is_down).to(dtype=gs.tc_int)
+        delta = torch.where(is_slow, slow_delta, torch.where(finished, slope_delta, torch.zeros_like(slope_delta)))
+        self._promote_streak = streak
+        self.terrain_levels += delta
         self.terrain_levels.clamp_(0, self._n_levels - 1)
 
     def _randomize_domain(self, envs_idx):

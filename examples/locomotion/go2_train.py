@@ -80,10 +80,10 @@ def main():
     parser.add_argument(
         "--terrain",
         choices=("plane", "curriculum"),
-        default="plane",
+        default="curriculum",
         help=(
-            "Ground under the robot. 'plane' keeps the flat walker. "
-            "'curriculum' adds slopes, rough slopes, obstacles and stairs."
+            "Ground under the robot. 'curriculum' draws vx, vy and yaw from [-1, 1] and moves each terrain row up or "
+            "down from tracking. 'plane' keeps the flat walker and its fixed forward command."
         ),
     )
     args = parser.parse_args()
@@ -118,9 +118,9 @@ if __name__ == "__main__":
     main()
 
 """
-# training, flat ground
-python examples/locomotion/go2_train.py
+# training. Commands are sampled from [-1, 1]. Terrain rows move with tracking.
+python examples/locomotion/go2_train.py -e go2-cmd-terrain
 
-# training, curriculum terrain. The actor reads proprioception, estimated velocity and the latent.
-python examples/locomotion/go2_train.py -e go2-curriculum --terrain curriculum
+# training, flat ground and a fixed forward command
+python examples/locomotion/go2_train.py -e go2-plane --terrain plane
 """
