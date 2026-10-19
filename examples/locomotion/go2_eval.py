@@ -134,8 +134,8 @@ def run_metrics(args):
     )
     split_vx = (args.vx, args.also_vx)
     levels, kinds, kind_names, commands = _group_rows(env, split_vx)
-    # Roll and pitch limits are the env fall flag. Widening them keeps a fallen base in place so displacement is the
-    # motion over the window, and the same thresholds are applied to the recorded euler afterwards.
+    # The fall flag is the tip from the heightfield normal. Widening the env limits keeps a fallen base in place so
+    # displacement is the motion over the window, and the saved thresholds are applied to that tip afterwards.
     roll_limit = env_cfg["termination_if_roll_greater_than"]
     pitch_limit = env_cfg["termination_if_pitch_greater_than"]
     env.env_cfg["termination_if_roll_greater_than"] = 180.0
@@ -188,10 +188,9 @@ def run_metrics(args):
                 vx_sum += vx
                 track_sum += torch.exp(-vel_error / sigma)
                 dx_4s = env.base_pos[:, 0] - origin_x
-            roll = torch.abs(env.base_euler[:, 0])
-            pitch = torch.abs(env.base_euler[:, 1])
             height = env.base_pos[:, 2] - env._terrain_z(env.base_pos[:, :2])
-            fell |= (roll > roll_limit) | (pitch > pitch_limit)
+            fell |= env.surface_tip_deg > roll_limit
+            fell |= env.surface_tip_deg > pitch_limit
             height_fell |= height < 0.15
             if camera is not None and step + 1 == video_steps:
                 camera.stop_recording()

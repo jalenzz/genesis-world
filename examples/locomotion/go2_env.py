@@ -13,7 +13,7 @@ from genesis.ext.isaacgym.terrain_utils import (
     pyramid_stairs_terrain,
     random_uniform_terrain,
 )
-from genesis.utils.geom import inv_quat, quat_to_xyz, transform_by_quat, transform_quat_by_quat
+from genesis.utils.geom import inv_quat, normalize, quat_to_xyz, transform_by_quat, transform_quat_by_quat
 
 from cenet import CENet, HISTORY_STEPS, LATENT_DIM, adaboot_uses_truth as adaboot_batch_uses_truth
 
@@ -422,6 +422,7 @@ class Go2Env:
 
         # Define global gravity direction vector
         self.global_gravity = torch.tensor([0.0, 0.0, -1.0], dtype=gs.tc_float, device=gs.device)
+        self._world_up = torch.tensor([0.0, 0.0, 1.0], dtype=gs.tc_float, device=gs.device)
         self._nominal_gravity = torch.tensor([0.0, 0.0, -9.81], dtype=gs.tc_float, device=gs.device)
 
         # Initial state
@@ -438,6 +439,11 @@ class Go2Env:
         self._cell_origins = None
         if self.terrain is not None:
             self._cell_origins = self._curriculum_origins()
+            # Elevations are already in meters. The pose is fixed, so the height query can reuse it every step.
+            self._height_field = torch.as_tensor(self.terrain.terrain_hf, dtype=gs.tc_float, device=gs.device)
+            self._terrain_pos = self._batch(self.terrain.get_pos()).clone()
+            self._terrain_quat = self._batch(self.terrain.get_quat()).clone()
+            self._terrain_inv_quat = inv_quat(self._terrain_quat)
 
         if self._has_domain_randomization:
             self._nominal_mass = self._shared_nominal(self.robot.get_links_mass())
@@ -485,6 +491,7 @@ class Go2Env:
         self.base_pos = torch.empty((self._batch_n, 3), dtype=gs.tc_float, device=gs.device)
         self.base_quat = torch.empty((self._batch_n, 4), dtype=gs.tc_float, device=gs.device)
         self.base_euler = torch.empty((self._batch_n, 3), dtype=gs.tc_float, device=gs.device)
+        self.surface_tip_deg = torch.zeros((self._batch_n,), dtype=gs.tc_float, device=gs.device)
         self.default_dof_pos = torch.tensor(
             [self.env_cfg["default_joint_angles"][name] for name in self.env_cfg["joint_names"]],
             dtype=gs.tc_float,
@@ -597,6 +604,41 @@ class Go2Env:
         if xy.ndim == 2:
             return self.terrain.get_terrain_height(xy[:, None, :])[:, 0]
         return self.terrain.get_terrain_height(xy)
+
+    def _terrain_normal(self, xy):
+        """Return the upward unit normal of the height field under each position.
+
+        A cell is two triangles, split on the same diagonal as the height query in kernel_get_terrain_height. The
+        normal is that face. A plane uses world up.
+        """
+        if self.terrain is None:
+            return self._world_up.expand(xy.shape[0], 3)
+        query = torch.stack((xy[:, 0], xy[:, 1], self._terrain_pos[:, 2]), dim=-1)
+        local = transform_by_quat(query - self._terrain_pos, self._terrain_inv_quat)
+        row_max = self._height_field.shape[0] - 1
+        col_max = self._height_field.shape[1] - 1
+        row = (local[:, 0] / self._horizontal_scale).clamp(0.0, row_max)
+        col = (local[:, 1] / self._horizontal_scale).clamp(0.0, col_max)
+        i_row = torch.floor(row).to(dtype=torch.long).clamp(max=row_max - 1)
+        i_col = torch.floor(col).to(dtype=torch.long).clamp(max=col_max - 1)
+        frac_row = row - i_row
+        frac_col = col - i_col
+        h00 = self._height_field[i_row, i_col]
+        h10 = self._height_field[i_row + 1, i_col]
+        h01 = self._height_field[i_row, i_col + 1]
+        h11 = self._height_field[i_row + 1, i_col + 1]
+        is_lower = frac_row + frac_col <= 1.0
+        rise = h00.new_full(h00.shape, self._horizontal_scale)
+        normal_lower = torch.stack((h00 - h10, h00 - h01, rise), dim=-1)
+        normal_upper = torch.stack((h01 - h11, h10 - h11, rise), dim=-1)
+        normal = normalize(torch.where(is_lower.unsqueeze(-1), normal_lower, normal_upper))
+        return transform_by_quat(normal, self._terrain_quat)
+
+    def _surface_tip_deg(self):
+        """Return the angle in degrees between the base up axis and the ground normal."""
+        base_up = transform_by_quat(self._world_up, self.base_quat)
+        normal = self._terrain_normal(self.base_pos[:, :2])
+        return torch.rad2deg(torch.acos((base_up * normal).sum(dim=-1).clamp(-1.0, 1.0)))
 
     def _reset_mask(self, envs_idx):
         if envs_idx is None:
@@ -777,10 +819,12 @@ class Go2Env:
 
         self._resample_commands(self.episode_length_buf % int(self.env_cfg["resampling_time_s"] / self.dt) == 0)
 
-        # check termination and reset
+        # The roll and pitch limits are the tip of the base up axis off the heightfield normal under the base.
+        # On flat ground that normal is world up, so a 10 degree tip still ends the episode.
+        self.surface_tip_deg = self._surface_tip_deg()
         self.reset_buf = self.episode_length_buf > self.max_episode_length
-        self.reset_buf |= torch.abs(self.base_euler[:, 1]) > self.env_cfg["termination_if_pitch_greater_than"]
-        self.reset_buf |= torch.abs(self.base_euler[:, 0]) > self.env_cfg["termination_if_roll_greater_than"]
+        self.reset_buf |= self.surface_tip_deg > self.env_cfg["termination_if_roll_greater_than"]
+        self.reset_buf |= self.surface_tip_deg > self.env_cfg["termination_if_pitch_greater_than"]
         # A pose reset clears errno. Checking it here is what makes an overflow halt instead of respawning forever.
         error_mask = self.scene.rigid_solver.get_error_envs_mask()
         if error_mask.ndim == 0:

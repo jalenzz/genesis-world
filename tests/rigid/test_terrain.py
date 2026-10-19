@@ -574,6 +574,74 @@ def test_curriculum_terrain_tracking(n_envs, show_viewer):
     if n_envs > 0:
         assert ((mass_after[0] - mass_after[1]).abs() > 1e-3).any()
 
+    identity = torch.tensor([1.0, 0.0, 0.0, 0.0], dtype=gs.tc_float, device=gs.device)
+    y_mid = 0.5 * subterrain_size[1]
+    steep_x0 = 9.0 * subterrain_size[0]
+    steep_tip = torch.empty((8,), dtype=gs.tc_float, device=gs.device)
+    for i in range(8):
+        env.base_pos[:, 0] = steep_x0 + (i + 0.5) * 0.5
+        env.base_pos[:, 1] = y_mid
+        env.base_quat[:] = identity
+        steep_tip[i] = env._surface_tip_deg()[0]
+    steep_i = int(torch.argmax(steep_tip))
+    assert steep_tip[steep_i] > 15.0
+    assert steep_tip[steep_i] < 30.0
+    env.base_pos[:, 0] = steep_x0 + (steep_i + 0.5) * 0.5
+    env.base_pos[:, 1] = y_mid
+    normal = env._terrain_normal(env.base_pos[:, :2])
+    parallel = gu.normalize(
+        torch.stack((1.0 + normal[:, 2], -normal[:, 1], normal[:, 0], torch.zeros_like(normal[:, 0])), dim=-1)
+    )
+    env.base_quat[:] = parallel
+    assert (env._surface_tip_deg() < 1.0).all()
+
+    env.base_pos[:, 0] = smooth_level0[0]
+    env.base_pos[:, 1] = smooth_level0[1]
+    env.base_quat[:] = identity
+    assert (env._surface_tip_deg() < 1.0).all()
+    pitched = gu.xyz_to_quat(
+        torch.tensor([0.0, 12.0, 0.0], dtype=gs.tc_float, device=gs.device),
+        rpy=True,
+        degrees=True,
+    ).expand(env._batch_n, 4)
+    env.base_quat[:] = pitched
+    assert (env._surface_tip_deg() > 10.0).all()
+    held_terrain = env.terrain
+    env.terrain = None
+    env.base_quat[:] = identity
+    assert (env._surface_tip_deg() < 1.0).all()
+    env.base_quat[:] = pitched
+    assert (env._surface_tip_deg() > 10.0).all()
+    env.terrain = held_terrain
+
+    env.env_cfg["termination_if_roll_greater_than"] = 10
+    env.env_cfg["termination_if_pitch_greater_than"] = 10
+    # Hold the posed base still. The assertion is the termination flag, and a physics substep would move it.
+    env.scene.step = lambda *args, **kwargs: None
+    steep_xy = (steep_x0 + (steep_i + 0.5) * 0.5, y_mid)
+    for xy, quat, falls in ((steep_xy, parallel, False), (smooth_level0, pitched, True)):
+        env.base_pos[:, 0] = xy[0]
+        env.base_pos[:, 1] = xy[1]
+        height = env._terrain_z(env.base_pos[:, :2]) + env.init_base_pos[2]
+        qpos = env.robot.get_qpos().clone()
+        if n_envs == 0:
+            qpos[0] = xy[0]
+            qpos[1] = xy[1]
+            qpos[2] = height[0]
+            qpos[3:7] = quat[0]
+        else:
+            qpos[:, 0] = xy[0]
+            qpos[:, 1] = xy[1]
+            qpos[:, 2] = height
+            qpos[:, 3:7] = quat
+        env.robot.set_qpos(qpos)
+        env.step(actions)
+        if falls:
+            assert bool(env.reset_buf.all())
+        else:
+            assert not bool(env.reset_buf.any())
+            assert (env.episode_length_buf == 1).all()
+
 
 @pytest.mark.parametrize("n_envs", [0, 2])
 def test_curriculum_action_reaches_joints(n_envs, show_viewer):
