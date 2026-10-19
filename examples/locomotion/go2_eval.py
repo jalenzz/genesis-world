@@ -322,6 +322,10 @@ def run_teleop(args):
         command_cfg=command_cfg,
         show_viewer=True,
     )
+    # 180 degrees is the largest angle between two axes, so the tilt check stays idle. The timeout still
+    # ends the episode.
+    env.env_cfg["termination_if_roll_greater_than"] = 180.0
+    env.env_cfg["termination_if_pitch_greater_than"] = 180.0
 
     def axis_keybinds(name, key, held_name):
         return (
