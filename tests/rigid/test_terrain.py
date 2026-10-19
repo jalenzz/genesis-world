@@ -687,12 +687,20 @@ def test_estimator_backward_from_inference_history():
         observations={"history": history, "proprio": proprio, "lin_vel": velocity},
         dones=dones,
     )
-    loss = env.update_estimator(storage)
+    cache_calls = []
+    empty_cache = torch.mps.empty_cache
+    torch.mps.empty_cache = lambda: cache_calls.append(True)
+    try:
+        loss = env.update_estimator(storage)
+    finally:
+        torch.mps.empty_cache = empty_cache
     assert math.isfinite(loss)
     assert env._cenet.encoder[0].weight.grad is not None
     assert env._cenet.encoder[0].weight.grad.abs().sum() > 0
     assert history.grad is None
     assert not history.requires_grad
+    assert history.device.type == "cpu"
+    assert cache_calls == []
 
 
 def test_cenet_belief_and_actor_groups():

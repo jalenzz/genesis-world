@@ -827,7 +827,14 @@ class Go2Env:
         self._cenet_optimizer.zero_grad()
         loss.backward()
         self._cenet_optimizer.step()
-        return float(loss.detach())
+        estimator_loss = float(loss.detach())
+        is_mps = history.device.type == "mps"
+        del history, next_proprio, velocity, alive, loss
+        # Freed MPS blocks stay in the caching allocator. After those blocks are paged out, the process footprint
+        # still includes them, and the next update allocates further blocks.
+        if is_mps:
+            torch.mps.empty_cache()
+        return estimator_loss
 
     def cenet_state_dict(self):
         """Return the estimator weights and optimizer state."""
