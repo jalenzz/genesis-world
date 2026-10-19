@@ -25,6 +25,7 @@ from rsl_rl.runners import OnPolicyRunner
 
 import genesis as gs
 from genesis.utils.geom import transform_by_quat
+from genesis.utils.misc import tensor_to_array
 from genesis.vis.keybindings import Key, KeyAction, Keybind
 
 from dreamwaq import DreamWaQRunner
@@ -293,8 +294,24 @@ def _publish_command(env, command):
 
 def _follow_base(env, offset):
     """Put the viewer behind the base in the base frame and aim it at the base."""
-    pos = env.base_pos[0]
-    env.scene.viewer.set_camera_pose(pos=pos + transform_by_quat(offset, env.base_quat[0]), lookat=pos)
+    pos = env.robot.get_pos()
+    quat = env.robot.get_quat()
+    if pos.ndim > 1:
+        pos = pos[0]
+    if quat.ndim > 1:
+        quat = quat[0]
+    viewer = env.scene.viewer
+    viewer.set_camera_pose(pos=pos + transform_by_quat(offset, quat), lookat=pos)
+    # The overview camera left the orbit center on the terrain. A drag or a scroll rebuilds the view around that
+    # center, so the chase pose moves the center onto the base. Each camera node receives that pose, because a
+    # refresh can draw any of them.
+    trackball = viewer._pyrender_viewer._trackball
+    target = tensor_to_array(pos).copy()
+    trackball._pose = trackball._n_pose
+    trackball._target = target
+    trackball._n_target = target.copy()
+    for node in viewer._pyrender_viewer.scene.camera_nodes:
+        node.matrix = trackball.pose
 
 
 def run_teleop(args):
@@ -350,7 +367,15 @@ def run_teleop(args):
         overwrite=True,
     )
     chase_offset = torch.tensor(CHASE_OFFSET, dtype=gs.tc_float, device=gs.device)
-    _follow_base(env, chase_offset)
+    # The viewer draws inside update, after the step has moved the base. base_pos still holds the previous step
+    # there, and a reset writes the spawn back into it, so the chase pose is taken from the live base.
+    update_viewer = env.scene.viewer.update
+
+    def update_and_chase(auto_refresh=None, force=False):
+        _follow_base(env, chase_offset)
+        return update_viewer(auto_refresh=auto_refresh, force=force)
+
+    env.scene.viewer.update = update_and_chase
 
     runner_cls = DreamWaQRunner if env_cfg.get("estimator") == "cenet" else OnPolicyRunner
     runner = runner_cls(env, train_cfg, log_dir, device=gs.device)
@@ -365,7 +390,6 @@ def run_teleop(args):
     )
 
     obs_dict = env.reset()
-    _follow_base(env, chase_offset)
 
     def command():
         vx = (1.0 if "w" in held_keys else 0.0) - (1.0 if "s" in held_keys else 0.0)
@@ -380,7 +404,6 @@ def run_teleop(args):
     obs_dict = _publish_command(env, command())
     with torch.no_grad():
         while is_running and env.scene.viewer.is_alive():
-            _follow_base(env, chase_offset)
             actions = policy(obs_dict)
             obs_dict, _rews, _dones, _infos = env.step(actions)
             obs_dict = _publish_command(env, command())
