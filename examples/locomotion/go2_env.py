@@ -26,7 +26,13 @@ def gs_rand(lower, upper, batch_shape):
 # Columns of the curriculum grid, in order. Rows are the difficulty levels.
 TERRAIN_KINDS = ("smooth_slope", "rough_slope", "discrete_obstacles", "stairs")
 # Episode share of each column: smooth slope, rough slope, discrete obstacles, stairs.
-TERRAIN_KIND_FRACTIONS = (0.28, 0.20, 0.12, 0.40)
+TERRAIN_KIND_FRACTIONS = (0.48, 0.20, 0.12, 0.20)
+# Forward caps, in order. Sampling uses [-1, cap]. A cap rises after 100 iterations when the mean of the last 50
+# per-step linear tracking rewards is at least 0.55.
+SPEED_VX_CAPS = (1.0, 1.25, 1.5, 1.75, 2.0)
+SPEED_PROMOTE_ITERS = 100
+SPEED_TRACK_WINDOW = 50
+SPEED_TRACK_BAR = 0.55
 # Flat-row share mixed into the row weights. Smooth slopes use the smaller share with a squared ramp.
 SMOOTH_FLAT_ROW_SHARE = 0.06
 OTHER_FLAT_ROW_SHARE = 0.12
@@ -186,18 +192,49 @@ def policy_obs_groups(env_cfg):
     return {"actor": ["policy"], "critic": ["policy"]}
 
 
+def raised_speed_cap(level, iters_at_cap, tracking_means):
+    """Return the forward-cap index after one iteration, and the tracking mean when it rises.
+
+    `level` selects `SPEED_VX_CAPS`. `iters_at_cap` counts iterations spent on that cap, including the one just
+    finished. `tracking_means` holds that cap's per-step linear tracking reward, oldest first. The index rises by one
+    after 100 iterations when the mean of the last 50 values is at least 0.55. The last index stays in place.
+    """
+    is_cap_open = level < len(SPEED_VX_CAPS) - 1
+    is_window_ready = iters_at_cap >= SPEED_PROMOTE_ITERS and len(tracking_means) >= SPEED_TRACK_WINDOW
+    if not is_cap_open or not is_window_ready:
+        return level, None
+    window = tracking_means[-SPEED_TRACK_WINDOW:]
+    mean = sum(window) / SPEED_TRACK_WINDOW
+    if mean + 1.0e-6 < SPEED_TRACK_BAR:
+        return level, None
+    return level + 1, mean
+
+
+def format_speed_curriculum(vx_max, iteration, tracking):
+    """Format the forward-cap line printed at the start of training and at each promotion."""
+    text = f"{vx_max:.2f}".rstrip("0").rstrip(".")
+    if "." not in text:
+        text += ".0"
+    if tracking is None:
+        tracking_text = "nan"
+    else:
+        tracking_text = f"{tracking:.4f}"
+    return f"speed_curriculum vx_max={text} iter={iteration} tracking_lin_vel={tracking_text}"
+
+
 def apply_curriculum(env_cfg, reward_cfg, command_cfg=None):
     """Point a walking config at the terrain curriculum, its rewards, and its domain randomization.
 
     The flat-ground entry leaves these fields unset. A height field produces more foot contacts than a plane, so the
     collision budget is raised with the terrain. The curriculum actor reads an estimated base velocity, so the context
-    estimator is enabled here. When a command config is passed, forward speed is drawn from [-1, 2], lateral speed
-    from [-0.6, 0.6], and yaw from [-1, 1].
+    estimator is enabled here. When a command config is passed, forward speed starts in [-1, 1] and its upper end
+    rises with tracking. Lateral speed is drawn from [-0.5, 0.5] and yaw from [-1, 1].
     """
     env_cfg["terrain"] = "curriculum"
     env_cfg["domain_randomization"] = True
     env_cfg["max_collision_pairs"] = 256
     env_cfg["estimator"] = "cenet"
+    env_cfg["speed_curriculum"] = True
     env_cfg["randomization"] = {
         "friction": (1.0, 1.0),
         "mass_scale": (1.0, 1.0),
@@ -214,8 +251,8 @@ def apply_curriculum(env_cfg, reward_cfg, command_cfg=None):
     }
     reward_cfg["reward_scales"] = curriculum_reward_scales()
     if command_cfg is not None:
-        command_cfg["lin_vel_x_range"] = [-1.0, 2.0]
-        command_cfg["lin_vel_y_range"] = [-0.6, 0.6]
+        command_cfg["lin_vel_x_range"] = [-1.0, SPEED_VX_CAPS[0]]
+        command_cfg["lin_vel_y_range"] = [-0.5, 0.5]
         command_cfg["ang_vel_range"] = [-1.0, 1.0]
 
 
@@ -483,6 +520,13 @@ class Go2Env:
                 self.command_cfg["ang_vel_range"],
             )
         )
+        self._speed_level = None
+        self._speed_iters_at_cap = 0
+        self._speed_tracking_means = []
+        self._speed_track_sum = 0.0
+        self._speed_track_count = 0
+        if env_cfg.get("speed_curriculum"):
+            self._speed_level = 0
         self.actions = torch.zeros((self._batch_n, self.num_actions), dtype=gs.tc_float, device=gs.device)
         self.last_actions = torch.zeros_like(self.actions)
         self.last_last_actions = torch.zeros_like(self.actions)
@@ -761,6 +805,30 @@ class Go2Env:
             return qpos[0]
         return qpos
 
+    def advance_speed_cap(self):
+        """Record this rollout's tracking and raise the forward cap when the promotion rule passes.
+
+        The returned pair is the new cap and the mean of the last 50 per-step tracking rewards. A rollout that does
+        not raise the cap returns nothing.
+        """
+        if self._speed_level is None:
+            return None
+        mean_step = self._speed_track_sum / self._speed_track_count
+        self._speed_track_sum = 0.0
+        self._speed_track_count = 0
+        self._speed_iters_at_cap += 1
+        self._speed_tracking_means.append(mean_step)
+        level, tracking = raised_speed_cap(self._speed_level, self._speed_iters_at_cap, self._speed_tracking_means)
+        if level == self._speed_level:
+            return None
+        self._speed_level = level
+        self._speed_iters_at_cap = 0
+        self._speed_tracking_means.clear()
+        vx_max = SPEED_VX_CAPS[level]
+        self.commands_limits[1][0] = vx_max
+        self.command_cfg["lin_vel_x_range"][1] = vx_max
+        return vx_max, tracking
+
     def _resample_commands(self, envs_idx):
         commands = gs_rand(*self.commands_limits, (self._batch_n,))
         if envs_idx is None:
@@ -815,6 +883,9 @@ class Go2Env:
             rew = reward_func() * self.reward_scales[name]
             self.rew_buf += rew
             self.episode_sums[name] += rew
+            if self._speed_level is not None and name == "tracking_lin_vel":
+                self._speed_track_sum += float(rew.sum())
+                self._speed_track_count += rew.numel()
         if self._cenet is not None:
             self._episode_return += self.rew_buf
 

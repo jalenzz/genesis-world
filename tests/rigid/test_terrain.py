@@ -828,9 +828,17 @@ def test_cenet_belief_and_actor_groups():
     assert scales["power_distribution"] == -1.0e-5
     assert "feet_air_time" not in scales
     assert "similar_to_default" not in scales
-    assert command_cfg["lin_vel_x_range"] == [-1.0, 2.0]
-    assert command_cfg["lin_vel_y_range"] == [-0.6, 0.6]
+    assert command_cfg["lin_vel_x_range"] == [-1.0, 1.0]
+    assert command_cfg["lin_vel_y_range"] == [-0.5, 0.5]
     assert command_cfg["ang_vel_range"] == [-1.0, 1.0]
+    assert env_cfg["speed_curriculum"] is True
+    assert go2_locomotion_env.TERRAIN_KIND_FRACTIONS == (0.48, 0.20, 0.12, 0.20)
+    held = [0.54] * 100
+    assert go2_locomotion_env.raised_speed_cap(0, 100, held) == (0, None)
+    assert go2_locomotion_env.raised_speed_cap(0, 99, [0.9] * 99) == (0, None)
+    assert go2_locomotion_env.raised_speed_cap(0, 100, [0.0] * 50 + [0.9] * 50)[0] == 1
+    assert go2_locomotion_env.raised_speed_cap(0, 100, [0.9] * 50 + [0.0] * 50) == (0, None)
+    assert go2_locomotion_env.raised_speed_cap(4, 200, [0.9] * 200) == (4, None)
     randomization = env_cfg["randomization"]
     assert randomization["payload"] == (-1.0, 2.0)
     assert randomization["friction_coefficient"] == (0.2, 1.25)

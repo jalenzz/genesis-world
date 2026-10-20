@@ -1,6 +1,8 @@
 import torch
 from rsl_rl.runners import OnPolicyRunner
 
+from go2_env import SPEED_VX_CAPS, format_speed_curriculum
+
 
 class DreamWaQRunner(OnPolicyRunner):
     """Train the walking policy and the context estimator on the same rollout."""
@@ -11,6 +13,8 @@ class DreamWaQRunner(OnPolicyRunner):
         self.env.set_latent_sampling(True)
         update = self.alg.update
         next_it = self.current_learning_iteration
+        if self.env._speed_level is not None:
+            print(format_speed_curriculum(SPEED_VX_CAPS[self.env._speed_level], next_it, None), flush=True)
 
         def update_and_estimator():
             # The policy update clears the rollout, so the estimator has to read it first.
@@ -26,6 +30,10 @@ class DreamWaQRunner(OnPolicyRunner):
                     f"schedule={self.alg.schedule}",
                     flush=True,
                 )
+            promoted = self.env.advance_speed_cap()
+            if promoted is not None:
+                vx_max, tracking = promoted
+                print(format_speed_curriculum(vx_max, next_it, tracking), flush=True)
             next_it += 1
             return loss_dict
 
