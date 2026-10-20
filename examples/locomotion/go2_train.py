@@ -81,7 +81,7 @@ def main():
         "--learning-rate",
         type=float,
         default=None,
-        help="PPO learning rate. When resuming, this replaces the rate stored in the checkpoint.",
+        help="PPO learning rate. When resuming, this replaces the checkpoint rate and the schedule stays fixed.",
     )
     parser.add_argument("--seed", type=int, default=1, help="Random seed")
     parser.add_argument(
@@ -102,6 +102,7 @@ def main():
     train_cfg = configure_train_cfg(args.exp_name, env_cfg)
     if args.learning_rate is not None:
         train_cfg["algorithm"]["learning_rate"] = args.learning_rate
+        train_cfg["algorithm"]["schedule"] = "fixed"
 
     if os.path.exists(log_dir):
         shutil.rmtree(log_dir)
@@ -123,8 +124,10 @@ def main():
         runner.load(args.resume)
         # The file stores the iteration just finished. The learning loop starts at that index.
         runner.current_learning_iteration += 1
-        # Loading restores the adaptive rate from the checkpoint. The requested rate replaces that value.
+        # Loading restores the adaptive rate from the checkpoint. The requested rate replaces that value,
+        # and a fixed schedule keeps later updates from changing it.
         if args.learning_rate is not None:
+            runner.alg.schedule = "fixed"
             runner.alg.learning_rate = args.learning_rate
             for param_group in runner.alg.optimizer.param_groups:
                 param_group["lr"] = args.learning_rate

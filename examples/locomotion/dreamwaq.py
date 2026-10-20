@@ -10,13 +10,23 @@ class DreamWaQRunner(OnPolicyRunner):
         self.env.set_estimator_ground_truth(True)
         self.env.set_latent_sampling(True)
         update = self.alg.update
+        next_it = self.current_learning_iteration
 
         def update_and_estimator():
             # The policy update clears the rollout, so the estimator has to read it first.
+            nonlocal next_it
             estimator_loss = self.env.update_estimator(self.alg.storage)
             loss_dict = update()
             loss_dict["cenet"] = estimator_loss
             self.env.set_estimator_ground_truth(self.env.adaboot_uses_truth())
+            # The rate is read after the update, which is where an adaptive schedule would have changed it.
+            if self.alg.schedule == "fixed":
+                print(
+                    f"Learning iteration {next_it} learning_rate={self.alg.learning_rate!r} "
+                    f"schedule={self.alg.schedule}",
+                    flush=True,
+                )
+            next_it += 1
             return loss_dict
 
         self.alg.update = update_and_estimator
