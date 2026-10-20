@@ -77,6 +77,12 @@ def main():
     parser.add_argument("-b", "--num-envs", type=int, default=4096, help="Number of parallel environments")
     parser.add_argument("--max-iterations", type=int, default=101, help="Number of learning iterations")
     parser.add_argument("--resume", type=str, default="", help="Checkpoint to load. Learning continues after it.")
+    parser.add_argument(
+        "--learning-rate",
+        type=float,
+        default=None,
+        help="PPO learning rate. When resuming, this replaces the rate stored in the checkpoint.",
+    )
     parser.add_argument("--seed", type=int, default=1, help="Random seed")
     parser.add_argument(
         "--terrain",
@@ -94,6 +100,8 @@ def main():
     if args.terrain == "curriculum":
         apply_curriculum(env_cfg, reward_cfg, command_cfg)
     train_cfg = configure_train_cfg(args.exp_name, env_cfg)
+    if args.learning_rate is not None:
+        train_cfg["algorithm"]["learning_rate"] = args.learning_rate
 
     if os.path.exists(log_dir):
         shutil.rmtree(log_dir)
@@ -115,6 +123,11 @@ def main():
         runner.load(args.resume)
         # The file stores the iteration just finished. The learning loop starts at that index.
         runner.current_learning_iteration += 1
+        # Loading restores the adaptive rate from the checkpoint. The requested rate replaces that value.
+        if args.learning_rate is not None:
+            runner.alg.learning_rate = args.learning_rate
+            for param_group in runner.alg.optimizer.param_groups:
+                param_group["lr"] = args.learning_rate
 
     runner.learn(num_learning_iterations=args.max_iterations, init_at_random_ep_len=True)
 

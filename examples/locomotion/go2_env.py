@@ -31,7 +31,7 @@ TERRAIN_KIND_FRACTIONS = (0.48, 0.20, 0.12, 0.20)
 SMOOTH_FLAT_ROW_SHARE = 0.06
 OTHER_FLAT_ROW_SHARE = 0.12
 # Consecutive episodes above the tracking bar before an obstacle or stair row may rise.
-SLOW_PROMOTE_EPISODES = 2
+SLOW_PROMOTE_EPISODES = 8
 
 
 class DomainRandomization(NamedTuple):
