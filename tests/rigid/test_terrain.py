@@ -828,8 +828,8 @@ def test_cenet_belief_and_actor_groups():
     assert scales["power_distribution"] == -1.0e-5
     assert "feet_air_time" not in scales
     assert "similar_to_default" not in scales
-    assert command_cfg["lin_vel_x_range"] == [-1.0, 1.0]
-    assert command_cfg["lin_vel_y_range"] == [-1.0, 1.0]
+    assert command_cfg["lin_vel_x_range"] == [-1.0, 2.0]
+    assert command_cfg["lin_vel_y_range"] == [-0.6, 0.6]
     assert command_cfg["ang_vel_range"] == [-1.0, 1.0]
     randomization = env_cfg["randomization"]
     assert randomization["payload"] == (-1.0, 2.0)

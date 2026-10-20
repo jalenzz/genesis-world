@@ -25,8 +25,8 @@ def gs_rand(lower, upper, batch_shape):
 
 # Columns of the curriculum grid, in order. Rows are the difficulty levels.
 TERRAIN_KINDS = ("smooth_slope", "rough_slope", "discrete_obstacles", "stairs")
-# Episode share of each column. Smooth slopes take half the batch. Rough slopes, obstacles, and stairs stay present.
-TERRAIN_KIND_FRACTIONS = (0.48, 0.20, 0.12, 0.20)
+# Episode share of each column: smooth slope, rough slope, discrete obstacles, stairs.
+TERRAIN_KIND_FRACTIONS = (0.28, 0.20, 0.12, 0.40)
 # Flat-row share mixed into the row weights. Smooth slopes use the smaller share with a squared ramp.
 SMOOTH_FLAT_ROW_SHARE = 0.06
 OTHER_FLAT_ROW_SHARE = 0.12
@@ -191,7 +191,8 @@ def apply_curriculum(env_cfg, reward_cfg, command_cfg=None):
 
     The flat-ground entry leaves these fields unset. A height field produces more foot contacts than a plane, so the
     collision budget is raised with the terrain. The curriculum actor reads an estimated base velocity, so the context
-    estimator is enabled here. When a command config is passed, linear and yaw commands are drawn from [-1, 1].
+    estimator is enabled here. When a command config is passed, forward speed is drawn from [-1, 2], lateral speed
+    from [-0.6, 0.6], and yaw from [-1, 1].
     """
     env_cfg["terrain"] = "curriculum"
     env_cfg["domain_randomization"] = True
@@ -213,8 +214,8 @@ def apply_curriculum(env_cfg, reward_cfg, command_cfg=None):
     }
     reward_cfg["reward_scales"] = curriculum_reward_scales()
     if command_cfg is not None:
-        command_cfg["lin_vel_x_range"] = [-1.0, 1.0]
-        command_cfg["lin_vel_y_range"] = [-1.0, 1.0]
+        command_cfg["lin_vel_x_range"] = [-1.0, 2.0]
+        command_cfg["lin_vel_y_range"] = [-0.6, 0.6]
         command_cfg["ang_vel_range"] = [-1.0, 1.0]
 
 

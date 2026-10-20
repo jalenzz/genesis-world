@@ -89,8 +89,9 @@ def main():
         choices=("plane", "curriculum"),
         default="curriculum",
         help=(
-            "Ground under the robot. 'curriculum' draws vx, vy and yaw from [-1, 1] and moves each terrain row up or "
-            "down from tracking. 'plane' keeps the flat walker and its fixed forward command."
+            "Ground under the robot. 'curriculum' draws vx from [-1, 2], vy from [-0.6, 0.6] and yaw from [-1, 1], "
+            "and moves each terrain row up or down from tracking. 'plane' keeps the flat walker and its fixed "
+            "forward command."
         ),
     )
     args = parser.parse_args()
@@ -139,7 +140,8 @@ if __name__ == "__main__":
     main()
 
 """
-# training. Commands are sampled from [-1, 1]. Terrain rows move with tracking.
+# training. Forward speed is sampled from [-1, 2], lateral from [-0.6, 0.6], yaw from [-1, 1].
+# Terrain rows move with tracking.
 python examples/locomotion/go2_train.py -e go2-cmd-terrain
 
 # training, flat ground and a fixed forward command
