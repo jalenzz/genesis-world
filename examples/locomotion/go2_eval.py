@@ -48,7 +48,7 @@ def _load_cfgs(exp_name):
         return pickle.load(f)
 
 
-def _make_env(exp_name, num_envs, show_viewer, terrain):
+def _make_env(exp_name, num_envs, show_viewer, terrain, rendered_envs_idx=None):
     env_cfg, obs_cfg, reward_cfg, command_cfg, train_cfg = _load_cfgs(exp_name)
     reward_cfg["reward_scales"] = {}
     if terrain == "curriculum":
@@ -57,6 +57,8 @@ def _make_env(exp_name, num_envs, show_viewer, terrain):
         env_cfg["max_collision_pairs"] = 256
     elif terrain == "plane":
         env_cfg["terrain"] = "plane"
+    if rendered_envs_idx is not None:
+        env_cfg["rendered_envs_idx"] = rendered_envs_idx
     env = Go2Env(
         num_envs=num_envs,
         env_cfg=env_cfg,
@@ -130,8 +132,20 @@ def run_metrics(args):
 
         gs.Scene.build = build_with_camera
 
+    rendered_envs_idx = None
+    if args.video and args.terrain == "curriculum":
+        # The second half of the batch is the middle level. Obstacles and stairs are adjacent columns there.
+        half = args.num_envs // 2
+        rendered_envs_idx = [
+            half + TERRAIN_KINDS.index("discrete_obstacles"),
+            half + TERRAIN_KINDS.index("stairs"),
+        ]
     env, env_cfg, reward_cfg, command_cfg, train_cfg = _make_env(
-        args.exp_name, args.num_envs, show_viewer=False, terrain=args.terrain
+        args.exp_name,
+        args.num_envs,
+        show_viewer=False,
+        terrain=args.terrain,
+        rendered_envs_idx=rendered_envs_idx,
     )
     split_vx = (args.vx, args.also_vx)
     levels, kinds, kind_names, commands = _group_rows(env, split_vx)
@@ -154,12 +168,25 @@ def run_metrics(args):
     camera = None
     if args.video:
         camera = cameras[0]
-        origin = env.base_pos[0]
-        camera.set_pose(
-            pos=(origin[0] - 1.5, origin[1] - 1.6, origin[2] + 0.55),
-            lookat=(origin[0], origin[1], origin[2] - 0.05),
-        )
-        camera.follow_entity(env.robot, fix_orientation=True)
+        if env.terrain is None:
+            origin = env.base_pos[0]
+            camera.set_pose(
+                pos=(origin[0] - 1.5, origin[1] - 1.6, origin[2] + 0.55),
+                lookat=(origin[0], origin[1], origin[2] - 0.05),
+            )
+            camera.follow_entity(env.robot, fix_orientation=True)
+        else:
+            mid = env._n_levels // 2
+            centers = env._cell_origins[
+                [mid, mid],
+                [TERRAIN_KINDS.index("discrete_obstacles"), TERRAIN_KINDS.index("stairs")],
+            ]
+            look = centers.mean(dim=0)
+            # Both columns stay in frame. Following one base would leave the other column.
+            camera.set_pose(
+                pos=(look[0] - 18.0, look[1], look[2] + 9.0),
+                lookat=(look[0], look[1], look[2] - 0.2),
+            )
         camera.start_recording(save_to_filename=args.video, fps=50)
 
     steps_4s = int(round(4.0 / env.dt))

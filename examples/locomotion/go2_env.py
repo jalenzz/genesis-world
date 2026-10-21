@@ -397,7 +397,7 @@ class Go2Env:
                 batch_dofs_info=self._has_domain_randomization,
             ),
             vis_options=gs.options.VisOptions(
-                rendered_envs_idx=[0],
+                rendered_envs_idx=env_cfg.get("rendered_envs_idx", [0]),
             ),
             viewer_options=gs.options.ViewerOptions(
                 camera_pos=camera_pos,
