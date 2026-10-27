@@ -29,7 +29,7 @@ from genesis.utils.misc import tensor_to_array
 from genesis.vis.keybindings import Key, KeyAction, Keybind
 
 from dreamwaq import DreamWaQRunner
-from go2_env import TERRAIN_KINDS, Go2Env
+from go2_env import TERRAIN_KINDS, Go2Env, is_dreamwaq_policy
 
 # Resting Xbox sticks sit a little off center. Inside this band the command is 0.
 STICK_DEADZONE = 0.15
@@ -157,7 +157,7 @@ def run_metrics(args):
     env.env_cfg["termination_if_pitch_greater_than"] = 180.0
 
     log_dir = f"logs/{args.exp_name}"
-    runner_cls = DreamWaQRunner if env_cfg.get("estimator") == "cenet" else OnPolicyRunner
+    runner_cls = DreamWaQRunner if is_dreamwaq_policy(env_cfg) else OnPolicyRunner
     runner = runner_cls(env, train_cfg, log_dir, device=gs.device)
     ckpt_path = os.path.join(log_dir, f"model_{args.ckpt}.pt")
     runner.load(ckpt_path)
@@ -404,7 +404,7 @@ def run_teleop(args):
 
     env.scene.viewer.update = update_and_chase
 
-    runner_cls = DreamWaQRunner if env_cfg.get("estimator") == "cenet" else OnPolicyRunner
+    runner_cls = DreamWaQRunner if is_dreamwaq_policy(env_cfg) else OnPolicyRunner
     runner = runner_cls(env, train_cfg, log_dir, device=gs.device)
     runner.load(ckpt_path)
     policy = runner.get_inference_policy(device=gs.device)

@@ -1,6 +1,8 @@
 import torch
 from rsl_rl.runners import OnPolicyRunner
 
+import genesis as gs
+
 from go2_env import SPEED_VX_CAPS, format_speed_curriculum
 
 
@@ -8,6 +10,8 @@ class DreamWaQRunner(OnPolicyRunner):
     """Train the walking policy and the context estimator on the same rollout."""
 
     def learn(self, num_learning_iterations, init_at_random_ep_len=False):
+        if not self.env.is_dreamwaq_policy:
+            raise gs.GenesisException("DreamWaQRunner requires env_cfg['policy'] == 'dreamwaq'.")
         # The first rollout has no finished episodes, so the actor starts on measured velocity.
         self.env.set_estimator_ground_truth(True)
         self.env.set_latent_sampling(True)
@@ -41,6 +45,8 @@ class DreamWaQRunner(OnPolicyRunner):
         super().learn(num_learning_iterations, init_at_random_ep_len)
 
     def save(self, path, infos=None):
+        if not self.env.is_dreamwaq_policy:
+            raise gs.GenesisException("DreamWaQRunner requires env_cfg['policy'] == 'dreamwaq'.")
         saved_dict = self.alg.save()
         saved_dict["iter"] = self.current_learning_iteration
         saved_dict["infos"] = infos
@@ -49,6 +55,8 @@ class DreamWaQRunner(OnPolicyRunner):
         self.logger.save_model(path, self.current_learning_iteration)
 
     def load(self, path, load_cfg=None, strict=True, map_location=None):
+        if not self.env.is_dreamwaq_policy:
+            raise gs.GenesisException("DreamWaQRunner requires env_cfg['policy'] == 'dreamwaq'.")
         infos = super().load(path, load_cfg, strict, map_location)
         loaded_dict = torch.load(path, weights_only=False, map_location=map_location)
         if "cenet_state_dict" in loaded_dict:

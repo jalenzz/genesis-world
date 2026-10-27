@@ -14,7 +14,16 @@ from rsl_rl.runners import OnPolicyRunner
 import genesis as gs
 
 from dreamwaq import DreamWaQRunner
-from go2_env import Go2Env, apply_curriculum, locomotion_cfgs, policy_obs_groups
+from go2_env import (
+    POLICY_DREAMWAQ,
+    POLICY_MLP,
+    POLICY_ULT,
+    Go2Env,
+    apply_curriculum,
+    locomotion_cfgs,
+    is_dreamwaq_policy,
+    policy_obs_groups,
+)
 
 
 def get_train_cfg(exp_name):
@@ -63,7 +72,7 @@ def get_train_cfg(exp_name):
 
 
 def configure_train_cfg(exp_name, env_cfg):
-    """Return the runner config, with estimator observation groups when the estimator is on."""
+    """Return the runner config, with DreamWaQ observation groups when that policy is selected."""
     train_cfg = get_train_cfg(exp_name)
     train_cfg["obs_groups"] = policy_obs_groups(env_cfg)
     return train_cfg
@@ -94,12 +103,27 @@ def main():
             "'plane' keeps the flat walker and its fixed forward command."
         ),
     )
+    parser.add_argument(
+        "--policy",
+        choices=(POLICY_MLP, POLICY_DREAMWAQ, POLICY_ULT),
+        default=None,
+        help=(
+            "Actor policy. Defaults to dreamwaq with --terrain curriculum and mlp with plane. "
+            "'ult' is reserved and not implemented."
+        ),
+    )
     args = parser.parse_args()
 
     log_dir = f"logs/{args.exp_name}"
     env_cfg, obs_cfg, reward_cfg, command_cfg = locomotion_cfgs()
     if args.terrain == "curriculum":
         apply_curriculum(env_cfg, reward_cfg, command_cfg)
+    if args.policy is not None:
+        env_cfg["policy"] = args.policy
+    elif args.terrain == "curriculum":
+        env_cfg["policy"] = POLICY_DREAMWAQ
+    else:
+        env_cfg["policy"] = POLICY_MLP
     train_cfg = configure_train_cfg(args.exp_name, env_cfg)
     if args.learning_rate is not None:
         train_cfg["algorithm"]["learning_rate"] = args.learning_rate
@@ -119,7 +143,7 @@ def main():
         num_envs=args.num_envs, env_cfg=env_cfg, obs_cfg=obs_cfg, reward_cfg=reward_cfg, command_cfg=command_cfg
     )
 
-    runner_cls = DreamWaQRunner if env_cfg.get("estimator") == "cenet" else OnPolicyRunner
+    runner_cls = DreamWaQRunner if is_dreamwaq_policy(env_cfg) else OnPolicyRunner
     runner = runner_cls(env, train_cfg, log_dir, device=gs.device)
     if args.resume:
         runner.load(args.resume)

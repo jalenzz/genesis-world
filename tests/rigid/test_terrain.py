@@ -464,6 +464,7 @@ def test_multicontact_sphere_vs_terrain(show_viewer, tol):
 def test_curriculum_terrain_tracking(n_envs, show_viewer):
     env_cfg, obs_cfg, reward_cfg, command_cfg = go2_locomotion_env.locomotion_cfgs()
     go2_locomotion_env.apply_curriculum(env_cfg, reward_cfg)
+    env_cfg["policy"] = go2_locomotion_env.POLICY_DREAMWAQ
     subterrain_size = (4.0, 4.0)
     env_cfg["episode_length_s"] = 1.0
     env_cfg["termination_if_roll_greater_than"] = 180
@@ -505,7 +506,7 @@ def test_curriculum_terrain_tracking(n_envs, show_viewer):
     assert torch.allclose(obs["lin_vel"], torch.zeros_like(obs["lin_vel"]))
     assert obs["est_vel"].abs().max() > 1.0e-3
     assert all("height" not in key for key in obs.keys())
-    groups = go2_locomotion_env.estimator_obs_groups()
+    groups = go2_locomotion_env.dreamwaq_obs_groups()
     actor_input = torch.cat([obs[name] for name in groups["actor"]], dim=-1)
     critic_input = torch.cat([obs[name] for name in groups["critic"]], dim=-1)
     assert groups["actor"] == ["proprio", "est_vel", "latent"]
@@ -647,6 +648,7 @@ def test_curriculum_terrain_tracking(n_envs, show_viewer):
 def test_curriculum_action_reaches_joints(n_envs, show_viewer):
     env_cfg, obs_cfg, reward_cfg, command_cfg = go2_locomotion_env.locomotion_cfgs()
     go2_locomotion_env.apply_curriculum(env_cfg, reward_cfg)
+    env_cfg["policy"] = go2_locomotion_env.POLICY_DREAMWAQ
     subterrain_size = (4.0, 4.0)
     env_cfg["episode_length_s"] = 20.0
     env_cfg["termination_if_roll_greater_than"] = 180
@@ -710,6 +712,7 @@ def test_proprio_history_fills_from_integer_reset_mask():
     batch = 2
     proprio_dim = 45
     env = go2_locomotion_env.Go2Env.__new__(go2_locomotion_env.Go2Env)
+    env._policy = go2_locomotion_env.POLICY_DREAMWAQ
     env._cenet = object()
     env._proprio_dim = proprio_dim
     env.obs_scales = {"ang_vel": 0.25, "dof_pos": 1.0, "dof_vel": 0.05}
@@ -735,6 +738,7 @@ def test_estimator_backward_from_inference_history():
     steps = 3
     proprio_dim = 45
     env = go2_locomotion_env.Go2Env.__new__(go2_locomotion_env.Go2Env)
+    env._policy = go2_locomotion_env.POLICY_DREAMWAQ
     env._batch_n = batch
     env._is_latent_sampled = False
     env._cenet = CENet(proprio_dim)
@@ -813,6 +817,9 @@ def test_cenet_belief_and_actor_groups():
     assert flat_groups["actor"] == ["policy"]
     assert flat_groups["critic"] == ["policy"]
     go2_locomotion_env.apply_curriculum(env_cfg, reward_cfg, command_cfg)
+    assert env_cfg.get("policy") is None
+    assert go2_locomotion_env.policy_name(env_cfg) == go2_locomotion_env.POLICY_MLP
+    env_cfg["policy"] = go2_locomotion_env.POLICY_DREAMWAQ
     scales = reward_cfg["reward_scales"]
     assert scales["tracking_lin_vel"] == 1.0
     assert scales["tracking_ang_vel"] == 0.5
@@ -854,3 +861,13 @@ def test_cenet_belief_and_actor_groups():
     assert "lin_vel" not in dream_groups["actor"]
     assert "disturbance" not in dream_groups["actor"]
     assert all("height" not in group for group in dream_groups["actor"])
+
+
+def test_legacy_estimator_alias_maps_to_dreamwaq_policy():
+    env_cfg = {"estimator": "cenet"}
+    assert go2_locomotion_env.is_dreamwaq_policy(env_cfg)
+    assert go2_locomotion_env.policy_obs_groups(env_cfg)["actor"] == ["proprio", "est_vel", "latent"]
+    env_cfg_copy = dict(env_cfg)
+    assert go2_locomotion_env.canonicalize_policy_env_cfg(env_cfg_copy) == go2_locomotion_env.POLICY_DREAMWAQ
+    assert env_cfg_copy["policy"] == go2_locomotion_env.POLICY_DREAMWAQ
+    assert "estimator" not in env_cfg_copy

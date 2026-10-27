@@ -72,6 +72,37 @@ DEFAULT_RANDOMIZATION = DomainRandomization(
 
 FOOT_LINK_NAMES = ("FR_foot", "FL_foot", "RR_foot", "RL_foot")
 
+POLICY_MLP = "mlp"
+POLICY_DREAMWAQ = "dreamwaq"
+POLICY_ULT = "ult"
+
+
+def policy_name(env_cfg):
+    """Return the walking policy named in an env config without mutating it.
+
+    ``policy`` is the source of truth. Legacy configs may still set ``estimator="cenet"``; that names the DreamWaQ
+    policy. When neither key is set, the flat MLP walker is assumed.
+    """
+    policy = env_cfg.get("policy")
+    if policy is None and env_cfg.get("estimator") == "cenet":
+        return POLICY_DREAMWAQ
+    if policy is None:
+        return POLICY_MLP
+    return policy
+
+
+def canonicalize_policy_env_cfg(env_cfg):
+    """Write the canonical ``policy`` key and drop legacy ``estimator`` fields."""
+    policy = policy_name(env_cfg)
+    env_cfg.pop("estimator", None)
+    env_cfg["policy"] = policy
+    return policy
+
+
+def is_dreamwaq_policy(env_cfg):
+    """Return whether the env config selects the DreamWaQ actor and context estimator."""
+    return policy_name(env_cfg) == POLICY_DREAMWAQ
+
 
 def locomotion_cfgs():
     """Return the flat-ground Go2 walking config used by the training entry."""
@@ -170,8 +201,8 @@ def curriculum_reward_scales():
     }
 
 
-def estimator_obs_groups():
-    """Return the actor and critic observation groups used with the context estimator.
+def dreamwaq_obs_groups():
+    """Return the actor and critic observation groups for the DreamWaQ policy.
 
     The actor reads the current proprioception, the estimated base linear velocity and the latent. The critic reads the
     proprioception together with the measured base linear velocity and the disturbance.
@@ -185,10 +216,10 @@ def estimator_obs_groups():
 def policy_obs_groups(env_cfg):
     """Return the actor and critic groups saved with a walking config.
 
-    The flat walker keeps the single proprioceptive group. The curriculum config selects the estimator groups.
+    The flat MLP walker keeps the single proprioceptive group. The DreamWaQ policy selects ``dreamwaq_obs_groups``.
     """
-    if env_cfg.get("estimator") == "cenet":
-        return estimator_obs_groups()
+    if is_dreamwaq_policy(env_cfg):
+        return dreamwaq_obs_groups()
     return {"actor": ["policy"], "critic": ["policy"]}
 
 
@@ -226,14 +257,13 @@ def apply_curriculum(env_cfg, reward_cfg, command_cfg=None):
     """Point a walking config at the terrain curriculum, its rewards, and its domain randomization.
 
     The flat-ground entry leaves these fields unset. A height field produces more foot contacts than a plane, so the
-    collision budget is raised with the terrain. The curriculum actor reads an estimated base velocity, so the context
-    estimator is enabled here. When a command config is passed, forward speed starts in [-1, 1] and its upper end
-    rises with tracking. Lateral speed is drawn from [-0.5, 0.5] and yaw from [-1, 1].
+    collision budget is raised with the terrain. Set ``env_cfg["policy"]`` separately when the DreamWaQ actor is
+    required. When a command config is passed, forward speed starts in [-1, 1] and its upper end rises with tracking.
+    Lateral speed is drawn from [-0.5, 0.5] and yaw from [-1, 1].
     """
     env_cfg["terrain"] = "curriculum"
     env_cfg["domain_randomization"] = True
     env_cfg["max_collision_pairs"] = 256
-    env_cfg["estimator"] = "cenet"
     env_cfg["speed_curriculum"] = True
     env_cfg["randomization"] = {
         "friction": (1.0, 1.0),
@@ -333,6 +363,10 @@ def build_curriculum_height_field(n_levels, subterrain_size, horizontal_scale, v
 
 
 class Go2Env:
+    @property
+    def is_dreamwaq_policy(self):
+        return self._policy == POLICY_DREAMWAQ
+
     def __init__(self, num_envs, env_cfg, obs_cfg, reward_cfg, command_cfg, show_viewer=False):
         self.num_envs: int = num_envs
         self._batch_n = num_envs if num_envs > 0 else 1
@@ -349,6 +383,11 @@ class Go2Env:
         self.obs_cfg = obs_cfg
         self.reward_cfg = reward_cfg
         self.command_cfg = command_cfg
+        self._policy = canonicalize_policy_env_cfg(self.env_cfg)
+        if self._policy == POLICY_ULT:
+            raise gs.GenesisException("ULT policy is reserved for a future extension and is not implemented.")
+        if self._policy not in (POLICY_MLP, POLICY_DREAMWAQ):
+            raise gs.GenesisException(f"Unknown policy '{self._policy}'.")
 
         self.obs_scales: dict[str, float] = obs_cfg["obs_scales"]
         self.reward_scales: dict[str, float] = reward_cfg["reward_scales"]
@@ -571,7 +610,7 @@ class Go2Env:
         self._is_latent_sampled = False
         self._published_observations = None
         self._proprio_dim = 9 + self.num_actions * 3
-        if env_cfg.get("estimator") == "cenet":
+        if self.is_dreamwaq_policy:
             self._cenet = CENet(self._proprio_dim).to(device=gs.device, dtype=gs.tc_float)
             self._cenet_optimizer = torch.optim.Adam(self._cenet.parameters(), lr=1.0e-3)
             self._history = torch.zeros(
@@ -886,7 +925,7 @@ class Go2Env:
             if self._speed_level is not None and name == "tracking_lin_vel":
                 self._speed_track_sum += float(rew.sum())
                 self._speed_track_count += rew.numel()
-        if self._cenet is not None:
+        if self.is_dreamwaq_policy:
             self._episode_return += self.rew_buf
 
         self._resample_commands(self.episode_length_buf % int(self.env_cfg["resampling_time_s"] / self.dt) == 0)
@@ -920,7 +959,7 @@ class Go2Env:
         return self.get_observations(), self.rew_buf, self.reset_buf, self.extras
 
     def get_observations(self):
-        if self._cenet is None:
+        if not self.is_dreamwaq_policy:
             self._published_observations = TensorDict({"policy": self.obs_buf}, batch_size=[self._batch_n])
             return self._published_observations
         velocity, latent = self._velocity_and_latent()
@@ -952,7 +991,7 @@ class Go2Env:
     def set_estimator_ground_truth(self, use_ground_truth):
         """Choose measured velocity or the estimator for the actor, including the observation already published."""
         self._is_ground_truth = use_ground_truth
-        if self._cenet is None or self._published_observations is None:
+        if not self.is_dreamwaq_policy or self._published_observations is None:
             return
         velocity, latent = self._velocity_and_latent()
         self._published_observations["est_vel"] = velocity
@@ -964,7 +1003,7 @@ class Go2Env:
 
     def adaboot_uses_truth(self):
         """Return whether the next batch should read ground truth, from the returns finished in this batch."""
-        if self._cenet is None or len(self._finished_returns) == 0:
+        if not self.is_dreamwaq_policy or len(self._finished_returns) == 0:
             return True
         returns = torch.cat(self._finished_returns)
         self._finished_returns.clear()
@@ -976,7 +1015,7 @@ class Go2Env:
         The reconstruction target is the next stored proprioception. A finished step is left out, because the following
         observation belongs to the next episode. A rollout with no continuing step returns zero.
         """
-        if self._cenet is None:
+        if not self.is_dreamwaq_policy:
             return 0.0
         # Clones leave inference tensors from the rollout. The loss gradient stays on the estimator parameters.
         history = storage.observations["history"][:-1].detach().clone()
@@ -1001,10 +1040,14 @@ class Go2Env:
 
     def cenet_state_dict(self):
         """Return the estimator weights and optimizer state."""
+        if not self.is_dreamwaq_policy:
+            raise gs.GenesisException("CENet state is only defined for the DreamWaQ policy.")
         return {"model": self._cenet.state_dict(), "optimizer": self._cenet_optimizer.state_dict()}
 
     def load_cenet_state_dict(self, state):
         """Load estimator weights and optimizer state saved beside the policy."""
+        if not self.is_dreamwaq_policy:
+            raise gs.GenesisException("CENet state is only defined for the DreamWaQ policy.")
         self._cenet.load_state_dict(state["model"])
         self._cenet_optimizer.load_state_dict(state["optimizer"])
 
@@ -1017,7 +1060,7 @@ class Go2Env:
             self.robot.set_qpos(self._spawn_qpos(), envs_idx=pose_envs, zero_velocity=True, skip_forward=True)
 
         # reset buffers
-        if self._cenet is not None:
+        if self.is_dreamwaq_policy:
             finished_mask = self._reset_mask(envs_idx) & (self.episode_length_buf > 0)
             if bool(finished_mask.any()):
                 self._finished_returns.append(self._episode_return[finished_mask].detach().clone())
@@ -1035,7 +1078,7 @@ class Go2Env:
             self.episode_length_buf.zero_()
             self.episode_tracking_lin.zero_()
             self.reset_buf.fill_(True)
-            if self._cenet is not None:
+            if self.is_dreamwaq_policy:
                 self._episode_return.zero_()
         else:
             torch.where(envs_idx[:, None], self.init_base_pos, self.base_pos, out=self.base_pos)
@@ -1053,7 +1096,7 @@ class Go2Env:
             self.episode_length_buf.masked_fill_(envs_idx, 0)
             self.episode_tracking_lin.masked_fill_(envs_idx, 0.0)
             self.reset_buf.masked_fill_(envs_idx, True)
-            if self._cenet is not None:
+            if self.is_dreamwaq_policy:
                 self._episode_return.masked_fill_(envs_idx, 0.0)
 
         if self.terrain is not None:
@@ -1092,7 +1135,7 @@ class Go2Env:
             ),
             dim=-1,
         )
-        if self._cenet is None:
+        if not self.is_dreamwaq_policy:
             return
         assert self.obs_buf.shape[-1] == self._proprio_dim
         rolled = torch.roll(self._history, shifts=-1, dims=1)
