@@ -17,12 +17,18 @@ from dreamwaq import DreamWaQRunner
 from go2_env import (
     POLICY_DREAMWAQ,
     POLICY_MLP,
+    POLICY_ULT,
+    ULT_HISTORY_STEPS,
+    ULT_PROPRIO_DIM,
+    ULT_TOKEN_DIM,
     Go2Env,
     apply_curriculum,
-    locomotion_cfgs,
     is_dreamwaq_policy,
+    is_ult_policy,
+    locomotion_cfgs,
     policy_obs_groups,
 )
+from ult import ULTRunner
 
 
 def get_train_cfg(exp_name):
@@ -70,8 +76,52 @@ def get_train_cfg(exp_name):
     return train_cfg_dict
 
 
+def configure_ult_train_cfg(exp_name, env_cfg):
+    """Return the runner config for the ULT transformer policy."""
+    train_cfg = get_train_cfg(exp_name)
+    train_cfg["obs_groups"] = policy_obs_groups(env_cfg)
+    train_cfg["algorithm"] = {
+        "class_name": "ult:ULTPPO",
+        "clip_param": 0.2,
+        "desired_kl": 0.008,
+        "entropy_coef": 0.005,
+        "gamma": 0.99,
+        "lam": 0.95,
+        "learning_rate": 3.0e-3,
+        "max_grad_norm": 1.0,
+        "num_learning_epochs": 5,
+        "num_mini_batches": 4,
+        "optimizer": "adamw",
+        "schedule": "fixed",
+        "use_clipped_value_loss": True,
+        "value_loss_coef": 1.0,
+        "ult_mix_alpha": 0.6,
+        "ult_aux_lambda": 1.0,
+        "ult_beta": 1.0,
+    }
+    train_cfg["actor"] = {
+        "class_name": "ult:ULTActorModel",
+        "history_steps": ULT_HISTORY_STEPS,
+        "proprio_dim": ULT_PROPRIO_DIM,
+        "token_dim": ULT_TOKEN_DIM,
+        "distribution_cfg": {
+            "class_name": "GaussianDistribution",
+            "init_std": 1.0,
+            "std_type": "scalar",
+        },
+    }
+    train_cfg["critic"] = {
+        "class_name": "MLPModel",
+        "hidden_dims": [512, 256, 128],
+        "activation": "elu",
+    }
+    return train_cfg
+
+
 def configure_train_cfg(exp_name, env_cfg):
-    """Return the runner config, with DreamWaQ observation groups when that policy is selected."""
+    """Return the runner config for the selected walking policy."""
+    if is_ult_policy(env_cfg):
+        return configure_ult_train_cfg(exp_name, env_cfg)
     train_cfg = get_train_cfg(exp_name)
     train_cfg["obs_groups"] = policy_obs_groups(env_cfg)
     return train_cfg
@@ -104,7 +154,7 @@ def main():
     )
     parser.add_argument(
         "--policy",
-        choices=(POLICY_MLP, POLICY_DREAMWAQ),
+        choices=(POLICY_MLP, POLICY_DREAMWAQ, POLICY_ULT),
         default=None,
         help="Actor policy. Defaults to dreamwaq with --terrain curriculum and mlp with plane.",
     )
@@ -139,7 +189,12 @@ def main():
         num_envs=args.num_envs, env_cfg=env_cfg, obs_cfg=obs_cfg, reward_cfg=reward_cfg, command_cfg=command_cfg
     )
 
-    runner_cls = DreamWaQRunner if is_dreamwaq_policy(env_cfg) else OnPolicyRunner
+    if is_dreamwaq_policy(env_cfg):
+        runner_cls = DreamWaQRunner
+    elif is_ult_policy(env_cfg):
+        runner_cls = ULTRunner
+    else:
+        runner_cls = OnPolicyRunner
     runner = runner_cls(env, train_cfg, log_dir, device=gs.device)
     if args.resume:
         runner.load(args.resume)
@@ -166,4 +221,7 @@ python examples/locomotion/go2_train.py -e go2-cmd-terrain
 
 # training, flat ground and a fixed forward command
 python examples/locomotion/go2_train.py -e go2-plane --terrain plane
+
+# ULT on the terrain curriculum
+python examples/locomotion/go2_train.py -e go2-ult --policy ult --terrain curriculum
 """

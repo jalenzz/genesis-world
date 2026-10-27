@@ -870,3 +870,32 @@ def test_saved_estimator_key_maps_to_dreamwaq_policy():
     assert go2_locomotion_env.canonicalize_policy_env_cfg(env_cfg_copy) == go2_locomotion_env.POLICY_DREAMWAQ
     assert env_cfg_copy["policy"] == go2_locomotion_env.POLICY_DREAMWAQ
     assert "estimator" not in env_cfg_copy
+
+
+def test_ult_policy_obs_groups_and_privilege_mask():
+    _ULT_PATH = _LOCOMOTION_DIR / "ult.py"
+    _ult_spec = importlib.util.spec_from_file_location("go2_locomotion_ult", _ULT_PATH)
+    go2_locomotion_ult = importlib.util.module_from_spec(_ult_spec)
+    _ult_spec.loader.exec_module(go2_locomotion_ult)
+
+    env_cfg, _, reward_cfg, command_cfg = go2_locomotion_env.locomotion_cfgs()
+    go2_locomotion_env.apply_curriculum(env_cfg, reward_cfg, command_cfg)
+    assert env_cfg.get("policy") is None
+    assert env_cfg.get("estimator") is None
+    env_cfg["policy"] = go2_locomotion_env.POLICY_ULT
+    assert not go2_locomotion_env.is_dreamwaq_policy(env_cfg)
+    groups = go2_locomotion_env.policy_obs_groups(env_cfg)
+    assert groups["actor"] == ["proprio_history", "action_history", "privilege", "nsa_target"]
+    assert groups["critic"] == ["proprio_flat", "privilege"]
+    assert go2_locomotion_env.ULT_PROPRIO_DIM == 37
+    assert go2_locomotion_env.ULT_HISTORY_STEPS == 15
+    assert go2_locomotion_env.ULT_PRIVILEGE_DIM == go2_locomotion_env.ULT_DOMAIN_PRIV_DIM + go2_locomotion_env.ULT_STATE_PRIV_DIM + go2_locomotion_env.ULT_HEIGHTMAP_SIDE ** 2
+
+    history_steps = go2_locomotion_env.ULT_HISTORY_STEPS
+    priv_idx = history_steps
+    mask = go2_locomotion_ult.ult_causal_attention_mask(history_steps, torch.device("cpu"))
+    assert mask[0, priv_idx]
+    assert mask[history_steps - 1, priv_idx]
+    assert not mask[0, 0]
+    assert mask[0, 1]
+    assert not mask[priv_idx, 0]
