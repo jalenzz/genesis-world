@@ -94,6 +94,14 @@ FOOT_LINK_NAMES = ("FR_foot", "FL_foot", "RR_foot", "RL_foot")
 
 POLICY_MLP = "mlp"
 POLICY_DREAMWAQ = "dreamwaq"
+POLICY_ULT = "ult"
+ULT_HISTORY_STEPS = 15
+ULT_PROPRIO_DIM = 37
+ULT_HEIGHTMAP_SIDE = 5
+ULT_DOMAIN_PRIV_DIM = 7
+ULT_STATE_PRIV_DIM = 9
+ULT_PRIVILEGE_DIM = ULT_DOMAIN_PRIV_DIM + ULT_STATE_PRIV_DIM + ULT_HEIGHTMAP_SIDE * ULT_HEIGHTMAP_SIDE
+ULT_TOKEN_DIM = ULT_PROPRIO_DIM + 12
 
 
 def is_dreamwaq_policy(env_cfg):
@@ -102,6 +110,11 @@ def is_dreamwaq_policy(env_cfg):
     The ``policy`` key names the actor, and a config without it selects the flat MLP walker.
     """
     return env_cfg.get("policy", POLICY_MLP) == POLICY_DREAMWAQ
+
+
+def is_ult_policy(env_cfg):
+    """Return whether the env config selects the ULT transformer policy."""
+    return env_cfg.get("policy", POLICY_MLP) == POLICY_ULT
 
 
 def locomotion_cfgs():
@@ -201,6 +214,14 @@ def curriculum_reward_scales():
     }
 
 
+def ult_obs_groups():
+    """Return the actor and critic observation groups for the ULT policy."""
+    return {
+        "actor": ["proprio_history", "action_history", "privilege", "nsa_target"],
+        "critic": ["proprio_flat", "privilege"],
+    }
+
+
 def dreamwaq_obs_groups():
     """Return the actor and critic observation groups for the DreamWaQ policy.
 
@@ -217,10 +238,12 @@ def dreamwaq_obs_groups():
 def policy_obs_groups(env_cfg):
     """Return the actor and critic groups saved with a walking config.
 
-    The flat MLP walker keeps the single proprioceptive group. The DreamWaQ policy selects ``dreamwaq_obs_groups``.
+    The flat MLP walker keeps the single proprioceptive group. DreamWaQ and ULT select their dedicated groups.
     """
     if is_dreamwaq_policy(env_cfg):
         return dreamwaq_obs_groups()
+    if is_ult_policy(env_cfg):
+        return ult_obs_groups()
     return {"actor": ["policy"], "critic": ["policy"]}
 
 
@@ -388,9 +411,10 @@ class Go2Env:
         self.reward_cfg = reward_cfg
         self.command_cfg = command_cfg
         self._policy = env_cfg.get("policy", POLICY_MLP)
-        if self._policy not in (POLICY_MLP, POLICY_DREAMWAQ):
+        if self._policy not in (POLICY_MLP, POLICY_DREAMWAQ, POLICY_ULT):
             raise gs.GenesisException(
-                f"Unknown policy '{self._policy}'. Supported policies: '{POLICY_MLP}' and '{POLICY_DREAMWAQ}'."
+                f"Unknown policy '{self._policy}'. Supported policies: '{POLICY_MLP}', '{POLICY_DREAMWAQ}', "
+                f"and '{POLICY_ULT}'."
             )
 
         self.obs_scales: dict[str, float] = obs_cfg["obs_scales"]
@@ -478,7 +502,7 @@ class Go2Env:
 
         # The foot is a fixed child of the calf, so the loader folds it into the calf. Clearance and foot contact
         # read that sphere as its own link, which means naming it here. The flat-ground rewards never read it.
-        needs_feet = "feet_clearance" in self.reward_scales
+        needs_feet = "feet_clearance" in self.reward_scales or self.is_ult_policy
         self.robot = self.scene.add_entity(
             gs.morphs.URDF(
                 file="urdf/go2/urdf/go2.urdf",
@@ -630,6 +654,26 @@ class Go2Env:
             scan_y = torch.tensor(HEIGHT_SCAN_Y, dtype=gs.tc_float, device=gs.device)
             grid_x, grid_y = torch.meshgrid(scan_x, scan_y, indexing="ij")
             self._height_scan_offsets = torch.stack((grid_x, grid_y), dim=-1).reshape(-1, 2)
+        self._ult_proprio_history = None
+        self._ult_action_history = None
+        self._ult_proprio_step = None
+        self._ult_privilege = None
+        self._ult_nsa_target = None
+        self._domain_privilege = torch.zeros(
+            (self.batch_size, ULT_DOMAIN_PRIV_DIM), dtype=gs.tc_float, device=gs.device
+        )
+        if self.is_ult_policy:
+            self._ult_proprio_history = torch.zeros(
+                (self.batch_size, ULT_HISTORY_STEPS, ULT_PROPRIO_DIM), dtype=gs.tc_float, device=gs.device
+            )
+            self._ult_action_history = torch.zeros(
+                (self.batch_size, ULT_HISTORY_STEPS, self.num_actions), dtype=gs.tc_float, device=gs.device
+            )
+            self._ult_proprio_step = torch.zeros(
+                (self.batch_size, ULT_PROPRIO_DIM), dtype=gs.tc_float, device=gs.device
+            )
+            self._ult_privilege = torch.zeros((self.batch_size, ULT_PRIVILEGE_DIM), dtype=gs.tc_float, device=gs.device)
+            self._ult_nsa_target = torch.zeros((self.batch_size, ULT_TOKEN_DIM), dtype=gs.tc_float, device=gs.device)
         self._feet_pos = None
         self._feet_vel = None
         self._dof_acc = None
@@ -665,6 +709,10 @@ class Go2Env:
     @property
     def is_dreamwaq_policy(self):
         return self._policy == POLICY_DREAMWAQ
+
+    @property
+    def is_ult_policy(self):
+        return self._policy == POLICY_ULT
 
     @property
     def speed_vx_cap(self):
@@ -814,16 +862,23 @@ class Go2Env:
         else:
             # The setter scales the authored coefficient, so an absolute coefficient becomes that ratio.
             friction = self._sample_interval(*ranges.friction_coefficient, (count, n_links)) / self._nominal_friction
-        mass = self._nominal_mass * self._sample_interval(*ranges.mass_scale, (count, n_links))
+        mass_scale = self._sample_interval(*ranges.mass_scale, (count, n_links))
+        mass = self._nominal_mass * mass_scale
         base_local = self._base_link.idx_local
-        mass[:, base_local] += self._sample_interval(*ranges.payload, (count,))
+        payload = self._sample_interval(*ranges.payload, (count,))
+        mass[:, base_local] += payload
         com = self._nominal_com.repeat(count, 1, 1)
         com[:, base_local] += self._sample_interval(-ranges.com_offset, ranges.com_offset, (count, 3))
         inertia = self._nominal_inertia * self._sample_interval(*ranges.inertia_scale, (count, n_links, 1, 1))
-        gravity = self._nominal_gravity * self._sample_interval(*ranges.gravity_scale, (count, 1))
-        kp = self.env_cfg["kp"] * self._sample_interval(*ranges.gain_scale, (count, self.num_actions))
+        gravity_scale = self._sample_interval(*ranges.gravity_scale, (count, 1))
+        gravity = self._nominal_gravity * gravity_scale
+        # Proportional and derivative gains are drawn independently. The privilege channel records the proportional one.
+        gain_scale = self._sample_interval(*ranges.gain_scale, (count, self.num_actions))
+        kp = self.env_cfg["kp"] * gain_scale
         kd = self.env_cfg["kd"] * self._sample_interval(*ranges.gain_scale, (count, self.num_actions))
         force_scale = self._sample_interval(*ranges.force_scale, (count, self.num_actions))
+        if self.is_ult_policy:
+            ult_domain = (friction, payload, gain_scale, force_scale, gravity_scale, mass_scale, base_local)
         if self.num_envs == 0:
             friction, mass, com, inertia, gravity, kp, kd, force_scale = (
                 friction[0],
@@ -859,6 +914,88 @@ class Go2Env:
         else:
             self._push_force[env_ids] = push
             self._action_delay[env_ids] = delay
+        if self.is_ult_policy:
+            friction, payload, gain_scale, force_scale, gravity_scale, mass_scale, base_local = ult_domain
+            self._record_domain_privilege(
+                env_ids,
+                friction,
+                payload,
+                gain_scale,
+                force_scale,
+                gravity_scale,
+                delay,
+                mass_scale,
+                base_local,
+            )
+
+    def _record_domain_privilege(
+        self,
+        env_ids,
+        friction,
+        payload,
+        gain_scale,
+        force_scale,
+        gravity_scale,
+        delay,
+        mass_scale,
+        base_local,
+    ):
+        domain = torch.stack(
+            (
+                friction[:, base_local],
+                payload,
+                gain_scale.mean(dim=-1),
+                force_scale.mean(dim=-1),
+                gravity_scale.reshape(-1),
+                delay,
+                mass_scale[:, base_local],
+            ),
+            dim=-1,
+        )
+        if env_ids is None:
+            self._domain_privilege.copy_(domain)
+        else:
+            self._domain_privilege[env_ids] = domain
+
+    def _foot_contact_flags(self):
+        if self._feet_pos is None:
+            return torch.zeros((self.batch_size, len(FOOT_LINK_NAMES)), dtype=gs.tc_float, device=gs.device)
+        foot_z = self._feet_pos[..., 2]
+        ground = self.terrain_height(self._feet_pos[..., :2])
+        return (foot_z - ground < 0.05).to(dtype=gs.tc_float)
+
+    def _local_heightmap(self):
+        side = ULT_HEIGHTMAP_SIDE
+        offsets = torch.linspace(-0.2, 0.2, side, dtype=gs.tc_float, device=gs.device)
+        grid_y, grid_x = torch.meshgrid(offsets, offsets, indexing="ij")
+        local_xy = torch.stack((grid_x.reshape(-1), grid_y.reshape(-1)), dim=-1)
+        world_xy = self.base_pos[:, :2].unsqueeze(1) + local_xy.unsqueeze(0)
+        relative = self.terrain_height(world_xy) - self.base_pos[:, 2].unsqueeze(-1)
+        return relative.reshape(self.batch_size, side * side)
+
+    def _compose_ult_privilege(self):
+        state = torch.cat(
+            (
+                self.base_lin_vel * self.obs_scales["lin_vel"],
+                self.base_ang_vel * self.obs_scales["ang_vel"],
+                self.base_euler * (math.pi / 180.0),
+            ),
+            dim=-1,
+        )
+        return torch.cat((self._domain_privilege, state, self._local_heightmap()), dim=-1)
+
+    def _build_ult_proprio_step(self):
+        return torch.cat(
+            (
+                (self.dof_pos - self.default_dof_pos) * self.obs_scales["dof_pos"],
+                self.dof_vel * self.obs_scales["dof_vel"],
+                self.base_ang_vel * self.obs_scales["ang_vel"],
+                self.projected_gravity,
+                self._foot_contact_flags(),
+                self.commands * self.commands_scale,
+            ),
+            dim=-1,
+        )
 
     def _apply_push(self):
         if not self._has_domain_randomization:
@@ -922,7 +1059,7 @@ class Go2Env:
         return self.get_observations()
 
     def _read_feet_and_motors(self):
-        needs_feet = "feet_clearance" in self.reward_functions
+        needs_feet = "feet_clearance" in self.reward_functions or self.is_ult_policy
         if needs_feet:
             self._feet_pos = self._batch(self.robot.get_links_pos(self._feet_idx))
             self._feet_vel = self._batch(self.robot.get_links_vel(self._feet_idx))
@@ -1025,6 +1162,18 @@ class Go2Env:
         return self.get_observations(), self.rew_buf, self.reset_buf, self.extras
 
     def get_observations(self):
+        if self.is_ult_policy:
+            self._published_observations = TensorDict(
+                {
+                    "proprio_history": self._ult_proprio_history,
+                    "action_history": self._ult_action_history,
+                    "privilege": self._ult_privilege,
+                    "nsa_target": self._ult_nsa_target,
+                    "proprio_flat": self._ult_proprio_step,
+                },
+                batch_size=[self.batch_size],
+            )
+            return self._published_observations
         if not self.is_dreamwaq_policy:
             self._published_observations = TensorDict({"policy": self.obs_buf}, batch_size=[self.batch_size])
             return self._published_observations
@@ -1217,6 +1366,24 @@ class Go2Env:
 
     def _update_observation(self):
         self.obs_buf = self._proprioception()
+        if self.is_ult_policy:
+            self._ult_nsa_target = torch.cat((self._ult_proprio_step, self.last_actions), dim=-1)
+            proprio = self._build_ult_proprio_step()
+            rolled_proprio = torch.roll(self._ult_proprio_history, shifts=-1, dims=1)
+            rolled_action = torch.roll(self._ult_action_history, shifts=-1, dims=1)
+            rolled_proprio[:, -1] = proprio
+            rolled_action[:, -1] = self.last_actions
+            filled_proprio = proprio[:, None, :].expand_as(self._ult_proprio_history)
+            filled_action = self.last_actions[:, None, :].expand_as(self._ult_action_history)
+            is_resetting = self.reset_buf[:, None, None] != 0
+            updated_proprio = torch.where(is_resetting, filled_proprio, rolled_proprio)
+            updated_action = torch.where(is_resetting, filled_action, rolled_action)
+            with torch.inference_mode(False):
+                self._ult_proprio_history = updated_proprio.detach().clone()
+                self._ult_action_history = updated_action.detach().clone()
+            self._ult_proprio_step = proprio
+            self._ult_privilege = self._compose_ult_privilege()
+            return
         if not self.is_dreamwaq_policy:
             return
         assert self.obs_buf.shape[-1] == self._proprio_dim

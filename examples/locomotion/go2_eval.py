@@ -15,7 +15,8 @@ except (metadata.PackageNotFoundError, ImportError, ValueError) as e:
 import genesis as gs
 
 from dreamwaq import CurriculumRunner
-from go2_env import TERRAIN_KINDS, Go2Env
+from go2_env import TERRAIN_KINDS, Go2Env, is_ult_policy
+from ult import ULTRunner
 
 
 def make_eval_env(
@@ -84,11 +85,15 @@ def load_policy(env, env_cfg, train_cfg, exp_name, ckpt):
     """
     log_dir = f"logs/{exp_name}"
     ckpt_path = os.path.join(log_dir, f"model_{ckpt}.pt")
-    runner = CurriculumRunner(env, train_cfg, log_dir, device=gs.device)
-    runner.load(
-        ckpt_path,
-        load_cfg={"actor": True, "estimator": True, "speed_curriculum": env_cfg.get("speed_curriculum")},
-    )
+    if is_ult_policy(env_cfg):
+        runner = ULTRunner(env, train_cfg, log_dir, device=gs.device)
+        runner.load(ckpt_path)
+    else:
+        runner = CurriculumRunner(env, train_cfg, log_dir, device=gs.device)
+        runner.load(
+            ckpt_path,
+            load_cfg={"actor": True, "estimator": True, "speed_curriculum": env_cfg.get("speed_curriculum")},
+        )
     return runner.get_inference_policy(device=gs.device), ckpt_path
 
 

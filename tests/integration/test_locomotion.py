@@ -328,3 +328,31 @@ def test_dreamwaq_terrain_rows(n_envs, show_viewer, locomotion):
     if n_envs > 0:
         assert not bool(env.reset_buf[1])
     assert torch.isfinite(env.robot.get_dofs_velocity()).all()
+
+
+def test_ult_policy_obs_groups_and_privilege_mask(locomotion):
+    go2_env, _cenet = locomotion
+    ult = importlib.import_module("ult")
+
+    env_cfg, _, reward_cfg, command_cfg = go2_env.locomotion_cfgs()
+    go2_env.apply_curriculum(env_cfg, reward_cfg, command_cfg)
+    assert env_cfg.get("policy") is None
+    assert env_cfg.get("estimator") is None
+    env_cfg["policy"] = go2_env.POLICY_ULT
+    assert not go2_env.is_dreamwaq_policy(env_cfg)
+    groups = go2_env.policy_obs_groups(env_cfg)
+    assert groups["actor"] == ["proprio_history", "action_history", "privilege", "nsa_target"]
+    assert groups["critic"] == ["proprio_flat", "privilege"]
+    assert go2_env.ULT_PROPRIO_DIM == 37
+    assert go2_env.ULT_HISTORY_STEPS == 15
+    privilege_dim = go2_env.ULT_DOMAIN_PRIV_DIM + go2_env.ULT_STATE_PRIV_DIM + go2_env.ULT_HEIGHTMAP_SIDE**2
+    assert go2_env.ULT_PRIVILEGE_DIM == privilege_dim
+
+    history_steps = go2_env.ULT_HISTORY_STEPS
+    priv_idx = history_steps
+    mask = ult.ult_causal_attention_mask(history_steps, torch.device("cpu"))
+    assert mask[0, priv_idx]
+    assert mask[history_steps - 1, priv_idx]
+    assert not mask[0, 0]
+    assert mask[0, 1]
+    assert not mask[priv_idx, 0]
