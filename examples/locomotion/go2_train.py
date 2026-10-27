@@ -17,7 +17,6 @@ from dreamwaq import DreamWaQRunner
 from go2_env import (
     POLICY_DREAMWAQ,
     POLICY_MLP,
-    POLICY_ULT,
     Go2Env,
     apply_curriculum,
     locomotion_cfgs,
@@ -105,12 +104,9 @@ def main():
     )
     parser.add_argument(
         "--policy",
-        choices=(POLICY_MLP, POLICY_DREAMWAQ, POLICY_ULT),
+        choices=(POLICY_MLP, POLICY_DREAMWAQ),
         default=None,
-        help=(
-            "Actor policy. Defaults to dreamwaq with --terrain curriculum and mlp with plane. "
-            "'ult' is reserved and not implemented."
-        ),
+        help="Actor policy. Defaults to dreamwaq with --terrain curriculum and mlp with plane.",
     )
     args = parser.parse_args()
 

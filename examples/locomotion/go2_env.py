@@ -74,27 +74,19 @@ FOOT_LINK_NAMES = ("FR_foot", "FL_foot", "RR_foot", "RL_foot")
 
 POLICY_MLP = "mlp"
 POLICY_DREAMWAQ = "dreamwaq"
-POLICY_ULT = "ult"
 
 
 def policy_name(env_cfg):
     """Return the walking policy named in an env config without mutating it.
 
-    ``policy`` is the source of truth. Legacy configs may still set ``estimator="cenet"``; that names the DreamWaQ
-    policy. When neither key is set, the flat MLP walker is assumed.
+    When ``policy`` is unset, the flat MLP walker is assumed.
     """
-    policy = env_cfg.get("policy")
-    if policy is None and env_cfg.get("estimator") == "cenet":
-        return POLICY_DREAMWAQ
-    if policy is None:
-        return POLICY_MLP
-    return policy
+    return env_cfg.get("policy", POLICY_MLP)
 
 
 def canonicalize_policy_env_cfg(env_cfg):
-    """Write the canonical ``policy`` key and drop legacy ``estimator`` fields."""
+    """Write the canonical ``policy`` key, defaulting to the MLP walker."""
     policy = policy_name(env_cfg)
-    env_cfg.pop("estimator", None)
     env_cfg["policy"] = policy
     return policy
 
@@ -384,8 +376,6 @@ class Go2Env:
         self.reward_cfg = reward_cfg
         self.command_cfg = command_cfg
         self._policy = canonicalize_policy_env_cfg(self.env_cfg)
-        if self._policy == POLICY_ULT:
-            raise gs.GenesisException("ULT policy is reserved for a future extension and is not implemented.")
         if self._policy not in (POLICY_MLP, POLICY_DREAMWAQ):
             raise gs.GenesisException(f"Unknown policy '{self._policy}'.")
 
