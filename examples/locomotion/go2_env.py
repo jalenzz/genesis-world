@@ -79,14 +79,21 @@ POLICY_DREAMWAQ = "dreamwaq"
 def policy_name(env_cfg):
     """Return the walking policy named in an env config without mutating it.
 
-    When ``policy`` is unset, the flat MLP walker is assumed.
+    ``policy`` is the source of truth. Saved configs may still carry ``estimator="cenet"``; that names the DreamWaQ
+    policy. When neither key is set, the flat MLP walker is assumed.
     """
-    return env_cfg.get("policy", POLICY_MLP)
+    policy = env_cfg.get("policy")
+    if policy is None and env_cfg.get("estimator") == "cenet":
+        return POLICY_DREAMWAQ
+    if policy is None:
+        return POLICY_MLP
+    return policy
 
 
 def canonicalize_policy_env_cfg(env_cfg):
-    """Write the canonical ``policy`` key, defaulting to the MLP walker."""
+    """Write the canonical ``policy`` key and drop legacy ``estimator`` fields."""
     policy = policy_name(env_cfg)
+    env_cfg.pop("estimator", None)
     env_cfg["policy"] = policy
     return policy
 
@@ -377,7 +384,9 @@ class Go2Env:
         self.command_cfg = command_cfg
         self._policy = canonicalize_policy_env_cfg(self.env_cfg)
         if self._policy not in (POLICY_MLP, POLICY_DREAMWAQ):
-            raise gs.GenesisException(f"Unknown policy '{self._policy}'.")
+            raise gs.GenesisException(
+                f"Unknown policy '{self._policy}'. Supported policies: '{POLICY_MLP}' and '{POLICY_DREAMWAQ}'."
+            )
 
         self.obs_scales: dict[str, float] = obs_cfg["obs_scales"]
         self.reward_scales: dict[str, float] = reward_cfg["reward_scales"]

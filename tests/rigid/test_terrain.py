@@ -861,3 +861,12 @@ def test_cenet_belief_and_actor_groups():
     assert "lin_vel" not in dream_groups["actor"]
     assert "disturbance" not in dream_groups["actor"]
     assert all("height" not in group for group in dream_groups["actor"])
+
+
+def test_saved_estimator_key_maps_to_dreamwaq_policy():
+    env_cfg = {"estimator": "cenet"}
+    assert go2_locomotion_env.is_dreamwaq_policy(env_cfg)
+    env_cfg_copy = dict(env_cfg)
+    assert go2_locomotion_env.canonicalize_policy_env_cfg(env_cfg_copy) == go2_locomotion_env.POLICY_DREAMWAQ
+    assert env_cfg_copy["policy"] == go2_locomotion_env.POLICY_DREAMWAQ
+    assert "estimator" not in env_cfg_copy
