@@ -39,6 +39,10 @@ SLOW_PROMOTE_EPISODES = 8
 MAX_INIT_TERRAIN_LEVEL = 5
 # A contact force above this on the base link counts as a fall.
 BASE_CONTACT_FORCE = 1.0
+# A joint or a base faster than this overflows the next integration. The step puts that environment back on its spawn.
+MAX_JOINT_SPEED = 100.0
+MAX_BASE_LINEAR_SPEED = 20.0
+MAX_BASE_ANGULAR_SPEED = 100.0
 # Height samples of the critic, on a grid in the base heading frame (forward x, left y), in meters.
 HEIGHT_SCAN_X = tuple(0.1 * i for i in range(-8, 9))
 HEIGHT_SCAN_Y = tuple(0.1 * i for i in range(-5, 6))
@@ -939,6 +943,19 @@ class Go2Env:
         ordered = target_dof_pos[:, self.actions_dof_idx]
         self._apply_push()
         self.robot.control_dofs_position(ordered if self.num_envs > 0 else ordered[0], slice(6, 18))
+        # The cached speeds are the previous step. A faster environment is back on its spawn before integration, and
+        # the reset below ends that episode.
+        joint_speed = torch.amax(self.dof_vel.abs(), dim=-1)
+        linear_speed = torch.linalg.norm(self.base_lin_vel, dim=-1)
+        angular_speed = torch.linalg.norm(self.base_ang_vel, dim=-1)
+        is_diverged = (
+            (joint_speed > MAX_JOINT_SPEED)
+            | (linear_speed > MAX_BASE_LINEAR_SPEED)
+            | (angular_speed > MAX_BASE_ANGULAR_SPEED)
+        )
+        if bool(is_diverged.any()):
+            pose_envs = None if self.num_envs == 0 else is_diverged
+            self.robot.set_qpos(self._spawn_qpos(), envs_idx=pose_envs, zero_velocity=True, skip_forward=True)
         self.scene.step()
 
         # update buffers
@@ -986,6 +1003,7 @@ class Go2Env:
         self.reset_buf = self.episode_length_buf > self.max_episode_length
         if self._is_fall_terminal:
             self.reset_buf |= self.is_fallen
+        self.reset_buf |= is_diverged
         # A pose reset clears errno. Checking it here is what makes an overflow halt instead of respawning forever.
         error_mask = self.scene.rigid_solver.get_error_envs_mask()
         if bool(error_mask.any()):

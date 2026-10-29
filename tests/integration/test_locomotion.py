@@ -310,3 +310,21 @@ def test_dreamwaq_terrain_rows(n_envs, show_viewer, locomotion):
             ),
             load_terrain=True,
         )
+
+    env.max_episode_length = 1000
+    env.reset()
+    env.episode_length_buf.zero_()
+    env._episode_steps.zero_()
+    motor_velocity = torch.zeros((env.batch_size, env.num_actions), dtype=gs.tc_float, device=gs.device)
+    motor_velocity[0] = 1.0e20
+    env.robot.set_dofs_velocity(motor_velocity if n_envs > 0 else motor_velocity[0], env.motors_dof_idx)
+    env.dof_vel[0] = 101.0
+    if n_envs > 0:
+        env.dof_vel[1] = 100.0
+        env.base_lin_vel[1, 0] = 20.0
+        env.base_ang_vel[1, 0] = 100.0
+    env.step(actions)
+    assert bool(env.reset_buf[0])
+    if n_envs > 0:
+        assert not bool(env.reset_buf[1])
+    assert torch.isfinite(env.robot.get_dofs_velocity()).all()
