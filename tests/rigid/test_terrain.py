@@ -497,7 +497,11 @@ def test_curriculum_terrain_tracking(n_envs, show_viewer):
         command_cfg=command_cfg,
         show_viewer=show_viewer,
     )
-    obs = env.get_observations()
+    # Spawn cells are sampled across levels and columns. Level 0 of one slope column per environment makes the
+    # promoted cell known.
+    env.terrain_levels.zero_()
+    env.terrain_types.copy_(torch.arange(env._batch_n, device=gs.device))
+    obs = env.reset()
     assert obs["proprio"].shape[-1] == 45
     assert obs["est_vel"].shape[-1] == 3
     assert obs["latent"].shape[-1] == LATENT_DIM
@@ -695,6 +699,8 @@ def test_curriculum_action_reaches_joints(n_envs, show_viewer):
         show_viewer=show_viewer,
     )
     assert env.scene.rigid_solver.max_collision_pairs == 256
+    env.terrain_levels.zero_()
+    env.reset()
     # The first step still executes a zero action. The next one must execute this action on the spawn cell.
     env.step(held)
     held_dof = env.robot.get_dofs_position().clone()

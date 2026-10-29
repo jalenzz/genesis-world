@@ -9,18 +9,17 @@ try:
         raise ImportError
 except (metadata.PackageNotFoundError, ImportError) as e:
     raise ImportError("Please install 'rsl-rl-lib>=5.0.0'.") from e
-from rsl_rl.runners import OnPolicyRunner
 
 import genesis as gs
 
-from dreamwaq import DreamWaQRunner
+from dreamwaq import DreamWaQRunner, SpeedCurriculumRunner
 from go2_env import (
     POLICY_DREAMWAQ,
     POLICY_MLP,
     Go2Env,
     apply_curriculum,
-    locomotion_cfgs,
     is_dreamwaq_policy,
+    locomotion_cfgs,
     policy_obs_groups,
 )
 
@@ -84,7 +83,12 @@ def main():
     )
     parser.add_argument("-b", "--num-envs", type=int, default=4096, help="Number of parallel environments")
     parser.add_argument("--max-iterations", type=int, default=101, help="Number of learning iterations")
-    parser.add_argument("--resume", type=str, default="", help="Checkpoint to load. Learning continues after it.")
+    parser.add_argument(
+        "--resume",
+        type=str,
+        default="",
+        help="Checkpoint to load. Learning continues after it, and the log directory keeps its earlier files.",
+    )
     parser.add_argument(
         "--learning-rate",
         type=float,
@@ -125,7 +129,8 @@ def main():
         train_cfg["algorithm"]["learning_rate"] = args.learning_rate
         train_cfg["algorithm"]["schedule"] = "fixed"
 
-    if os.path.exists(log_dir):
+    # The resume checkpoint usually lives in this log directory.
+    if os.path.exists(log_dir) and not args.resume:
         shutil.rmtree(log_dir)
     os.makedirs(log_dir, exist_ok=True)
 
@@ -139,7 +144,7 @@ def main():
         num_envs=args.num_envs, env_cfg=env_cfg, obs_cfg=obs_cfg, reward_cfg=reward_cfg, command_cfg=command_cfg
     )
 
-    runner_cls = DreamWaQRunner if is_dreamwaq_policy(env_cfg) else OnPolicyRunner
+    runner_cls = DreamWaQRunner if is_dreamwaq_policy(env_cfg) else SpeedCurriculumRunner
     runner = runner_cls(env, train_cfg, log_dir, device=gs.device)
     if args.resume:
         runner.load(args.resume)
