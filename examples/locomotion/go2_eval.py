@@ -1,4 +1,5 @@
 import argparse
+import math
 import os
 import pickle
 import time
@@ -24,7 +25,7 @@ except (metadata.PackageNotFoundError, ImportError, ValueError) as e:
 from rsl_rl.runners import OnPolicyRunner
 
 import genesis as gs
-from genesis.utils.geom import transform_by_quat
+from genesis.utils.geom import pos_lookat_up_to_T, quat_to_xyz, transform_by_quat, xyz_to_quat
 from genesis.utils.misc import tensor_to_array
 from genesis.vis.keybindings import Key, KeyAction, Keybind
 
@@ -34,7 +35,7 @@ from ult import ULTRunner
 
 # Resting Xbox sticks sit a little off center. Inside this band the command is 0.
 STICK_DEADZONE = 0.15
-# Chase camera in the base frame. +x is forward, so this sits behind the base and above it.
+# Chase camera in the base heading frame (yaw only, world z up). +x is forward, so this sits behind and above.
 CHASE_OFFSET = (-1.5, 0.0, 0.55)
 # IOKit axis order: 0 left X, 1 left Y, 2 left trigger, 3 right X, 4 right Y, 5 right trigger.
 LEFT_STICK_X = 0
@@ -49,7 +50,7 @@ def _load_cfgs(exp_name):
         return pickle.load(f)
 
 
-def _make_env(exp_name, num_envs, show_viewer, terrain, rendered_envs_idx=None):
+def _make_env(exp_name, num_envs, show_viewer, terrain, terrain_level=None, pin_easiest=False, rendered_envs_idx=None):
     env_cfg, obs_cfg, reward_cfg, command_cfg, train_cfg = _load_cfgs(exp_name)
     reward_cfg["reward_scales"] = {}
     if terrain == "curriculum":
@@ -58,6 +59,25 @@ def _make_env(exp_name, num_envs, show_viewer, terrain, rendered_envs_idx=None):
         env_cfg["max_collision_pairs"] = 256
     elif terrain == "plane":
         env_cfg["terrain"] = "plane"
+    terrain_kind = env_cfg.get("terrain", "plane")
+    n_levels = env_cfg.get("terrain_levels", 10)
+    spawn_level = None
+    if terrain_level is not None:
+        if terrain_kind != "curriculum":
+            raise SystemExit("--terrain-level requires curriculum terrain")
+        if terrain_level < 0 or terrain_level >= n_levels:
+            raise SystemExit(f"--terrain-level {terrain_level} is outside 0..{n_levels - 1}")
+        # Row i keeps its slope from build_curriculum_height_field. The mesh stops after the requested row.
+        env_cfg["terrain_difficulty_levels"] = n_levels
+        env_cfg["terrain_levels"] = terrain_level + 1
+        spawn_level = terrain_level
+    elif pin_easiest and terrain_kind == "curriculum":
+        spawn_level = 0
+    if spawn_level is not None:
+        env_cfg["initial_terrain_level"] = spawn_level
+        # Mean tracking sits in (0, 1], and a row moves only past these bounds, so the pinned row stays put.
+        env_cfg["curriculum_up"] = 1.0
+        env_cfg["curriculum_down"] = 0.0
     if rendered_envs_idx is not None:
         env_cfg["rendered_envs_idx"] = rendered_envs_idx
     env = Go2Env(
@@ -77,7 +97,7 @@ def _pin_commands(env, commands):
     return env.get_observations()
 
 
-def _group_rows(env, split_vx):
+def _group_rows(env, split_vx, terrain_level=None):
     """Label each environment with the terrain cell and the forward command it holds."""
     n = env._batch_n
     if env.terrain is None:
@@ -89,7 +109,10 @@ def _group_rows(env, split_vx):
         levels = torch.zeros((n,), dtype=gs.tc_int, device=gs.device)
         kinds = torch.arange(n, device=gs.device) % len(TERRAIN_KINDS)
         half = n // 2
-        levels[half:] = mid
+        if terrain_level is None:
+            levels[half:] = mid
+        else:
+            levels.fill_(terrain_level)
         kinds[half:] = torch.arange(n - half, device=gs.device) % len(TERRAIN_KINDS)
         env.terrain_levels.copy_(levels)
         env.terrain_types.copy_(kinds)
@@ -135,7 +158,7 @@ def run_metrics(args):
 
     rendered_envs_idx = None
     if args.video and args.terrain == "curriculum":
-        # The second half of the batch is the middle level. Obstacles and stairs are adjacent columns there.
+        # Obstacles and stairs are adjacent columns in the second half of the batch.
         half = args.num_envs // 2
         rendered_envs_idx = [
             half + TERRAIN_KINDS.index("discrete_obstacles"),
@@ -146,10 +169,11 @@ def run_metrics(args):
         args.num_envs,
         show_viewer=False,
         terrain=args.terrain,
+        terrain_level=args.terrain_level,
         rendered_envs_idx=rendered_envs_idx,
     )
     split_vx = (args.vx, args.also_vx)
-    levels, kinds, kind_names, commands = _group_rows(env, split_vx)
+    levels, kinds, kind_names, commands = _group_rows(env, split_vx, terrain_level=args.terrain_level)
     # The fall flag is the tip from the heightfield normal. Widening the env limits keeps a fallen base in place so
     # displacement is the motion over the window, and the saved thresholds are applied to that tip afterwards.
     roll_limit = env_cfg["termination_if_roll_greater_than"]
@@ -182,9 +206,9 @@ def run_metrics(args):
             )
             camera.follow_entity(env.robot, fix_orientation=True)
         else:
-            mid = env._n_levels // 2
+            row = env._n_levels // 2 if args.terrain_level is None else args.terrain_level
             centers = env._cell_origins[
-                [mid, mid],
+                [row, row],
                 [TERRAIN_KINDS.index("discrete_obstacles"), TERRAIN_KINDS.index("stairs")],
             ]
             look = centers.mean(dim=0)
@@ -325,16 +349,22 @@ def _publish_command(env, command):
     return env.get_observations()
 
 
-def _follow_base(env, offset):
-    """Put the viewer behind the base in the base frame and aim it at the base."""
+def _follow_base(env, offset, world_up):
+    """Put the viewer behind the base along its heading and aim it at the base, with world up as screen up."""
     pos = env.robot.get_pos()
     quat = env.robot.get_quat()
     if pos.ndim > 1:
         pos = pos[0]
     if quat.ndim > 1:
         quat = quat[0]
+    # Base pitch and roll would swing the camera off the heading and tilt the horizon, so only the yaw is kept.
+    euler = quat_to_xyz(quat, rpy=True)
+    euler[:2] = 0.0
+    eye = pos + transform_by_quat(offset, xyz_to_quat(euler, rpy=True))
+    # 'set_camera_pose(pos=, lookat=)' feeds the previous camera y axis back as the up vector, which accumulates
+    # roll as the heading turns. An explicit pose keeps world up.
     viewer = env.scene.viewer
-    viewer.set_camera_pose(pos=pos + transform_by_quat(offset, quat), lookat=pos)
+    viewer.set_camera_pose(pose=pos_lookat_up_to_T(eye, pos, world_up))
     # The overview camera left the orbit center on the terrain. A drag or a scroll rebuilds the view around that
     # center, so the chase pose moves the center onto the base. Each camera node receives that pose, because a
     # refresh can draw any of them.
@@ -351,8 +381,6 @@ def run_teleop(args):
     gs.init(backend=gs.cpu)
 
     log_dir = f"logs/{args.exp_name}"
-    env_cfg, obs_cfg, reward_cfg, command_cfg, train_cfg = _load_cfgs(args.exp_name)
-    reward_cfg["reward_scales"] = {}
     ckpt_path = os.path.join(log_dir, f"model_{args.ckpt}.pt")
 
     pad = _open_pad()
@@ -364,18 +392,19 @@ def run_teleop(args):
     def release_key(name):
         held_keys.discard(name)
 
-    env = Go2Env(
+    env, env_cfg, _, _, train_cfg = _make_env(
+        args.exp_name,
         num_envs=1,
-        env_cfg=env_cfg,
-        obs_cfg=obs_cfg,
-        reward_cfg=reward_cfg,
-        command_cfg=command_cfg,
         show_viewer=True,
+        terrain=args.terrain,
+        terrain_level=args.terrain_level,
+        pin_easiest=True,
     )
-    # 180 degrees is the largest angle between two axes, so the tilt check stays idle. The timeout still
-    # ends the episode.
+    # 180 degrees is the largest angle between two axes, so the tilt check stays idle. An infinite episode length
+    # keeps the timeout idle too, so only R resets the robot.
     env.env_cfg["termination_if_roll_greater_than"] = 180.0
     env.env_cfg["termination_if_pitch_greater_than"] = 180.0
+    env.max_episode_length = math.inf
 
     def axis_keybinds(name, key, held_name):
         return (
@@ -384,10 +413,16 @@ def run_teleop(args):
         )
 
     is_running = True
+    is_reset_requested = False
 
     def stop():
         nonlocal is_running
         is_running = False
+
+    # The viewer runs callbacks inside the step, so the reset waits for the loop.
+    def request_reset():
+        nonlocal is_reset_requested
+        is_reset_requested = True
 
     env.scene.viewer.register_keybinds(
         *axis_keybinds("forward", Key.W, "w"),
@@ -396,16 +431,18 @@ def run_teleop(args):
         *axis_keybinds("strafe_right", Key.E, "e"),
         *axis_keybinds("yaw_left", Key.A, "a"),
         *axis_keybinds("yaw_right", Key.D, "d"),
+        Keybind("reset", Key.R, KeyAction.RELEASE, callback=request_reset),
         Keybind("quit", Key.ESCAPE, KeyAction.RELEASE, callback=stop),
         overwrite=True,
     )
     chase_offset = torch.tensor(CHASE_OFFSET, dtype=gs.tc_float, device=gs.device)
+    world_up = torch.tensor((0.0, 0.0, 1.0), dtype=gs.tc_float, device=gs.device)
     # The viewer draws inside update, after the step has moved the base. base_pos still holds the previous step
     # there, and a reset writes the spawn back into it, so the chase pose is taken from the live base.
     update_viewer = env.scene.viewer.update
 
     def update_and_chase(auto_refresh=None, force=False):
-        _follow_base(env, chase_offset)
+        _follow_base(env, chase_offset, world_up)
         return update_viewer(auto_refresh=auto_refresh, force=force)
 
     env.scene.viewer.update = update_and_chase
@@ -424,7 +461,7 @@ def run_teleop(args):
     print(
         f"ckpt={ckpt_path} pad={pad_name} deadzone={STICK_DEADZONE} "
         f"vx=-axis{LEFT_STICK_Y} vy=-axis{LEFT_STICK_X} yaw=-axis{RIGHT_STICK_X} "
-        "keys W/S vx, Q/E vy, A/D yaw, Esc quit"
+        "keys W/S vx, Q/E vy, A/D yaw, R reset, Esc quit"
     )
 
     obs_dict = env.reset()
@@ -443,7 +480,10 @@ def run_teleop(args):
     with torch.no_grad():
         while is_running and env.scene.viewer.is_alive():
             actions = policy(obs_dict)
-            obs_dict, _rews, _dones, _infos = env.step(actions)
+            env.step(actions)
+            if is_reset_requested:
+                env.reset()
+                is_reset_requested = False
             obs_dict = _publish_command(env, command())
 
 
@@ -462,6 +502,15 @@ def main():
     )
     parser.add_argument("--num-envs", type=int, default=1)
     parser.add_argument("--terrain", choices=("config", "plane", "curriculum"), default="config")
+    parser.add_argument(
+        "--terrain-level",
+        type=int,
+        default=None,
+        help=(
+            "Curriculum row to spawn on, 0-based, 0 easiest. The mesh keeps rows 0 through this index at the saved "
+            "curriculum slopes, and every env spawns on this row. Requires curriculum terrain."
+        ),
+    )
     parser.add_argument("--vx", type=float, default=0.5, help="Forward command in m/s, held for the whole run")
     parser.add_argument(
         "--also-vx", type=float, default=None, help="Forward command used by the second half of the envs"
@@ -485,6 +534,9 @@ if __name__ == "__main__":
 # Teleop on logs/go2-smooth-slope/model_2999.pt. Left stick is vx/vy, right stick x is yaw, each in [-1, 1].
 # W/S, Q/E, and A/D command the same axes when the pad is absent or that stick is inside the deadzone.
 uv run python examples/locomotion/go2_eval.py
+
+# go2-stable checkpoint 3999 on curriculum row 2. The mesh keeps rows 0..2 and the robot spawns on row 2.
+uv run python examples/locomotion/go2_eval.py -e go2-stable --ckpt 3999 --terrain curriculum --terrain-level 2
 
 # Metrics. The log's saved config selects flat ground or the curriculum terrain.
 python examples/locomotion/go2_eval.py -e go2-walking --ckpt 100 --metrics

@@ -6,27 +6,18 @@ import genesis as gs
 from go2_env import SPEED_VX_CAPS, format_speed_curriculum
 
 
-class DreamWaQRunner(OnPolicyRunner):
-    """Train the walking policy and the context estimator on the same rollout."""
+class SpeedCurriculumRunner(OnPolicyRunner):
+    """Train the walking policy and raise the forward speed cap after each policy update."""
 
     def learn(self, num_learning_iterations, init_at_random_ep_len=False):
-        if not self.env.is_dreamwaq_policy:
-            raise gs.GenesisException("DreamWaQRunner requires env_cfg['policy'] == 'dreamwaq'.")
-        # The first rollout has no finished episodes, so the actor starts on measured velocity.
-        self.env.set_estimator_ground_truth(True)
-        self.env.set_latent_sampling(True)
         update = self.alg.update
         next_it = self.current_learning_iteration
         if self.env._speed_level is not None:
             print(format_speed_curriculum(SPEED_VX_CAPS[self.env._speed_level], next_it, None), flush=True)
 
-        def update_and_estimator():
-            # The policy update clears the rollout, so the estimator has to read it first.
+        def update_and_speed_cap():
             nonlocal next_it
-            estimator_loss = self.env.update_estimator(self.alg.storage)
             loss_dict = update()
-            loss_dict["cenet"] = estimator_loss
-            self.env.set_estimator_ground_truth(self.env.adaboot_uses_truth())
             # The rate is read after the update, which is where an adaptive schedule would have changed it.
             if self.alg.schedule == "fixed":
                 print(
@@ -39,6 +30,29 @@ class DreamWaQRunner(OnPolicyRunner):
                 vx_max, tracking = promoted
                 print(format_speed_curriculum(vx_max, next_it, tracking), flush=True)
             next_it += 1
+            return loss_dict
+
+        self.alg.update = update_and_speed_cap
+        super().learn(num_learning_iterations, init_at_random_ep_len)
+
+
+class DreamWaQRunner(SpeedCurriculumRunner):
+    """Train the walking policy and the context estimator on the same rollout."""
+
+    def learn(self, num_learning_iterations, init_at_random_ep_len=False):
+        if not self.env.is_dreamwaq_policy:
+            raise gs.GenesisException("DreamWaQRunner requires env_cfg['policy'] == 'dreamwaq'.")
+        # The first rollout has no finished episodes, so the actor starts on measured velocity.
+        self.env.set_estimator_ground_truth(True)
+        self.env.set_latent_sampling(True)
+        update = self.alg.update
+
+        def update_and_estimator():
+            # The policy update clears the rollout, so the estimator has to read it first.
+            estimator_loss = self.env.update_estimator(self.alg.storage)
+            loss_dict = update()
+            loss_dict["cenet"] = estimator_loss
+            self.env.set_estimator_ground_truth(self.env.adaboot_uses_truth())
             return loss_dict
 
         self.alg.update = update_and_estimator
