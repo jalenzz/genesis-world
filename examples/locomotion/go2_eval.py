@@ -24,7 +24,7 @@ except (metadata.PackageNotFoundError, ImportError, ValueError) as e:
 from rsl_rl.runners import OnPolicyRunner
 
 import genesis as gs
-from genesis.utils.geom import transform_by_quat
+from genesis.utils.geom import pos_lookat_up_to_T, quat_to_xyz, transform_by_quat, xyz_to_quat
 from genesis.utils.misc import tensor_to_array
 from genesis.vis.keybindings import Key, KeyAction, Keybind
 
@@ -33,7 +33,7 @@ from go2_env import TERRAIN_KINDS, Go2Env, is_dreamwaq_policy
 
 # Resting Xbox sticks sit a little off center. Inside this band the command is 0.
 STICK_DEADZONE = 0.15
-# Chase camera in the base frame. +x is forward, so this sits behind the base and above it.
+# Chase camera in the base heading frame (yaw only, world z up). +x is forward, so this sits behind and above.
 CHASE_OFFSET = (-1.5, 0.0, 0.55)
 # IOKit axis order: 0 left X, 1 left Y, 2 left trigger, 3 right X, 4 right Y, 5 right trigger.
 LEFT_STICK_X = 0
@@ -48,9 +48,7 @@ def _load_cfgs(exp_name):
         return pickle.load(f)
 
 
-def _make_env(
-    exp_name, num_envs, show_viewer, terrain, terrain_level=None, pin_easiest=False, rendered_envs_idx=None
-):
+def _make_env(exp_name, num_envs, show_viewer, terrain, terrain_level=None, pin_easiest=False, rendered_envs_idx=None):
     env_cfg, obs_cfg, reward_cfg, command_cfg, train_cfg = _load_cfgs(exp_name)
     reward_cfg["reward_scales"] = {}
     if terrain == "curriculum":
@@ -344,16 +342,22 @@ def _publish_command(env, command):
     return env.get_observations()
 
 
-def _follow_base(env, offset):
-    """Put the viewer behind the base in the base frame and aim it at the base."""
+def _follow_base(env, offset, world_up):
+    """Put the viewer behind the base along its heading and aim it at the base, with world up as screen up."""
     pos = env.robot.get_pos()
     quat = env.robot.get_quat()
     if pos.ndim > 1:
         pos = pos[0]
     if quat.ndim > 1:
         quat = quat[0]
+    # Base pitch and roll would swing the camera off the heading and tilt the horizon, so only the yaw is kept.
+    euler = quat_to_xyz(quat, rpy=True)
+    euler[:2] = 0.0
+    eye = pos + transform_by_quat(offset, xyz_to_quat(euler, rpy=True))
+    # 'set_camera_pose(pos=, lookat=)' feeds the previous camera y axis back as the up vector, which accumulates
+    # roll as the heading turns. An explicit pose keeps world up.
     viewer = env.scene.viewer
-    viewer.set_camera_pose(pos=pos + transform_by_quat(offset, quat), lookat=pos)
+    viewer.set_camera_pose(pose=pos_lookat_up_to_T(eye, pos, world_up))
     # The overview camera left the orbit center on the terrain. A drag or a scroll rebuilds the view around that
     # center, so the chase pose moves the center onto the base. Each camera node receives that pose, because a
     # refresh can draw any of them.
@@ -417,12 +421,13 @@ def run_teleop(args):
         overwrite=True,
     )
     chase_offset = torch.tensor(CHASE_OFFSET, dtype=gs.tc_float, device=gs.device)
+    world_up = torch.tensor((0.0, 0.0, 1.0), dtype=gs.tc_float, device=gs.device)
     # The viewer draws inside update, after the step has moved the base. base_pos still holds the previous step
     # there, and a reset writes the spawn back into it, so the chase pose is taken from the live base.
     update_viewer = env.scene.viewer.update
 
     def update_and_chase(auto_refresh=None, force=False):
-        _follow_base(env, chase_offset)
+        _follow_base(env, chase_offset, world_up)
         return update_viewer(auto_refresh=auto_refresh, force=force)
 
     env.scene.viewer.update = update_and_chase
