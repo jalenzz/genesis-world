@@ -1,48 +1,46 @@
-import torch
-import torch.nn as nn
+import math
 
+import torch
 from rsl_rl.algorithms.ppo import PPO
 from rsl_rl.env import VecEnv
 from rsl_rl.models import MLPModel
 from rsl_rl.modules import HiddenState
-from rsl_rl.runners import OnPolicyRunner
 from rsl_rl.storage import RolloutStorage
 from rsl_rl.utils import resolve_class, resolve_obs_groups
 from tensordict import TensorDict
+from torch import nn
 
 import genesis as gs
-
-from go2_env import SPEED_VX_CAPS, ULT_TOKEN_DIM, format_speed_curriculum
 
 EMBED_DIM = 128
 TRANSFORMER_LAYERS = 2
 ATTENTION_HEADS = 4
 # Rollout bookkeeping stored beside the observations, so the minibatch shuffle keeps it aligned with each transition.
 EXECUTED_TEACHER_KEY = "ult_is_teacher"
-NSA_TARGET_KEY = "ult_nsa_target"
-NSA_VALID_KEY = "ult_is_nsa_valid"
+
+
+def ult_tokens(obs: TensorDict) -> torch.Tensor:
+    """Return the state-action tokens z_k = (o_k, a_{k-1}) of the history window, oldest first."""
+    return torch.cat((obs["proprio_history"], obs["action_history"]), dim=-1)
 
 
 def ult_causal_attention_mask(history_steps, device):
-    """Return a transformer mask that blocks disallowed attention positions.
+    """Return the boolean attention mask of a history window followed by one privilege token, True where blocked.
 
-    The sequence is ``history_steps`` proprio-action tokens followed by one privilege token. Proprio queries keep a
-    causal mask over proprio keys and cannot attend the privilege key. The privilege query may attend all proprio keys.
+    Every token attends to itself and the tokens before it. The privilege token comes last, so it attends to the whole
+    history while no history token attends to it.
     """
-    seq_len = history_steps + 1
-    priv_idx = history_steps
-    allowed = torch.zeros((seq_len, seq_len), dtype=torch.bool, device=device)
-    for query in range(history_steps):
-        for key in range(history_steps):
-            allowed[query, key] = key <= query
-    for key in range(history_steps):
-        allowed[priv_idx, key] = True
-    allowed[priv_idx, priv_idx] = True
-    return ~allowed
+    return ~torch.ones((history_steps + 1, history_steps + 1), dtype=torch.bool, device=device).tril()
 
 
 class ULTActorModel(nn.Module):
-    """Causal-transformer actor with student and teacher action heads."""
+    """Causal transformer actor of the Unified Locomotion Transformer (ULT), with a student and a teacher action.
+
+    The history tokens share one linear embedding and the privilege goes through a three-layer encoder appended as the
+    last token. A shared linear decoder maps each history output to the next state-action token. The action part of
+    the prediction from the newest token is the student action. A three-layer MLP on the privilege output gives the
+    teacher action. Both actions are the mean of the same Gaussian distribution.
+    """
 
     is_recurrent: bool = False
 
@@ -53,31 +51,26 @@ class ULTActorModel(nn.Module):
         obs_set: str,
         output_dim: int,
         history_steps: int,
-        proprio_dim: int,
-        token_dim: int,
+        distribution_cfg: dict,
         embed_dim: int = EMBED_DIM,
         n_layers: int = TRANSFORMER_LAYERS,
         n_heads: int = ATTENTION_HEADS,
-        distribution_cfg: dict | None = None,
     ) -> None:
         super().__init__()
-        if distribution_cfg is None:
-            raise ValueError("ULTActorModel requires a Gaussian distribution configuration.")
         dist_class, dist_cfg = resolve_class(distribution_cfg)
         self.distribution = dist_class(output_dim, **dist_cfg)
-        self.history_steps = history_steps
-        self.proprio_dim = proprio_dim
-        self.token_dim = token_dim
-        self.obs_groups = obs_groups[obs_set]
+        # The student mean is a slice of the predicted token, so the distribution must read a bare mean.
+        assert self.distribution.input_dim == output_dim
+        self.proprio_dim = obs["proprio_history"].shape[-1]
+        token_dim = self.proprio_dim + obs["action_history"].shape[-1]
 
         self.token_embed = nn.Linear(token_dim, embed_dim)
-        privilege_dim = obs["privilege"].shape[-1]
         self.privilege_encoder = nn.Sequential(
-            nn.Linear(privilege_dim, embed_dim),
+            nn.Linear(obs["privilege"].shape[-1], 256),
             nn.ELU(),
-            nn.Linear(embed_dim, embed_dim),
+            nn.Linear(256, 128),
             nn.ELU(),
-            nn.Linear(embed_dim, embed_dim),
+            nn.Linear(128, embed_dim),
         )
         encoder_layer = nn.TransformerEncoderLayer(
             d_model=embed_dim,
@@ -88,41 +81,36 @@ class ULTActorModel(nn.Module):
             batch_first=True,
             norm_first=True,
         )
-        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=n_layers)
-        self.student_action = nn.Sequential(
-            nn.Linear(embed_dim, embed_dim),
-            nn.ELU(),
-            nn.Linear(embed_dim, self.distribution.input_dim),
-        )
+        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=n_layers, enable_nested_tensor=False)
+        self.next_token = nn.Linear(embed_dim, token_dim)
         self.teacher_action = nn.Sequential(
-            nn.Linear(embed_dim, embed_dim),
+            nn.Linear(embed_dim, 128),
             nn.ELU(),
-            nn.Linear(embed_dim, self.distribution.input_dim),
-        )
-        self.nsa_head = nn.Sequential(
-            nn.Linear(embed_dim, embed_dim),
+            nn.Linear(128, 128),
             nn.ELU(),
-            nn.Linear(embed_dim, ULT_TOKEN_DIM),
+            nn.Linear(128, output_dim),
         )
-        self._attn_mask = ult_causal_attention_mask(history_steps, device=obs.device)
 
-    def _embed_history(self, obs: TensorDict) -> torch.Tensor:
-        return self.token_embed(torch.cat((obs["proprio_history"], obs["action_history"]), dim=-1))
-
-    def _encode_student(self, obs: TensorDict) -> torch.Tensor:
-        # The privilege token sits after every proprio token and is masked out of their queries, so dropping it leaves
-        # the student state unchanged and spares the privilege input at deployment.
-        encoded = self.transformer(self._embed_history(obs), mask=self._attn_mask[:-1, :-1])
-        return encoded[:, -1]
+        # Sinusoidal position encoding of the original transformer, over the history positions and the privilege one.
+        position = torch.arange(history_steps + 1, dtype=gs.tc_float).unsqueeze(1)
+        frequency = torch.exp(torch.arange(0, embed_dim, 2, dtype=gs.tc_float) * (-math.log(10000.0) / embed_dim))
+        positional_encoding = torch.zeros((history_steps + 1, embed_dim), dtype=gs.tc_float)
+        positional_encoding[:, 0::2] = torch.sin(position * frequency)
+        positional_encoding[:, 1::2] = torch.cos(position * frequency)
+        self.register_buffer("positional_encoding", positional_encoding, persistent=False)
+        self.register_buffer("attn_mask", ult_causal_attention_mask(history_steps, "cpu"), persistent=False)
 
     def forward_heads(self, obs: TensorDict) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Return student and teacher distribution inputs and the next-state-action prediction."""
+        """Run the full sequence and return the next-token predictions, the student action and the teacher action.
+
+        The prediction at history position k is the token z_{k+1}. The last one carries the student action in its
+        action part.
+        """
         privilege = self.privilege_encoder(obs["privilege"]).unsqueeze(1)
-        sequence = torch.cat((self._embed_history(obs), privilege), dim=1)
-        encoded = self.transformer(sequence, mask=self._attn_mask)
-        student_state = encoded[:, self.history_steps - 1]
-        teacher_state = encoded[:, self.history_steps]
-        return self.student_action(student_state), self.teacher_action(teacher_state), self.nsa_head(student_state)
+        sequence = torch.cat((self.token_embed(ult_tokens(obs)), privilege), dim=1) + self.positional_encoding
+        encoded = self.transformer(sequence, mask=self.attn_mask)
+        next_tokens = self.next_token(encoded[:, :-1])
+        return next_tokens, next_tokens[:, -1, self.proprio_dim :], self.teacher_action(encoded[:, -1])
 
     def forward(
         self,
@@ -131,15 +119,18 @@ class ULTActorModel(nn.Module):
         hidden_state: HiddenState = None,
         stochastic_output: bool = False,
     ) -> torch.Tensor:
-        """Return the student action, which reads the proprio and action history alone."""
-        mlp_output = self.student_action(self._encode_student(obs))
-        if stochastic_output:
-            self.distribution.update(mlp_output)
-            return self.distribution.sample()
-        return self.distribution.deterministic_output(mlp_output)
+        """Return the student action, computed from the history window alone.
 
-    def get_latent(self, obs: TensorDict, masks: torch.Tensor | None = None, hidden_state: HiddenState = None):
-        return self._encode_student(obs)
+        The privilege token comes after every history token and none of them attends to it, so dropping it leaves the
+        student action unchanged. Deployment therefore needs no privilege input.
+        """
+        sequence = self.token_embed(ult_tokens(obs)) + self.positional_encoding[:-1]
+        encoded = self.transformer(sequence, mask=self.attn_mask[:-1, :-1])
+        mean = self.next_token(encoded[:, -1])[:, self.proprio_dim :]
+        if stochastic_output:
+            self.distribution.update(mean)
+            return self.distribution.sample()
+        return self.distribution.deterministic_output(mean)
 
     def reset(self, dones: torch.Tensor | None = None, hidden_state: HiddenState = None) -> None:
         pass
@@ -179,11 +170,14 @@ class ULTActorModel(nn.Module):
 
 
 class ULTPPO(PPO):
-    """PPO with teacher-student action mixing and ULT auxiliary losses.
+    """PPO with the ULT action mixer, next state-action prediction and action imitation.
 
-    Every rollout transition records which action head produced its action (see ``EXECUTED_TEACHER_KEY``), so the
-    update evaluates the log-probability under that same head. The next-state-action target of a transition is the
-    newest proprio and action token of the following observation, valid only when the episode continues.
+    Each environment plays the teacher action with probability ``ult_mix_alpha`` and the student action otherwise. The
+    choice is drawn again for every rollout and stored with each transition, so the update evaluates the
+    log-probability under the head that acted. The loss adds ``ult_aux_lambda * (L_n + ult_beta * L_a)`` to the PPO
+    loss, where ``L_n`` is the squared error of the next state-action predictions over the history window and ``L_a``
+    the squared distance between the teacher and student actions. The learning rate follows a cosine decay over
+    ``lr_cosine_iterations`` updates.
     """
 
     def __init__(
@@ -191,6 +185,7 @@ class ULTPPO(PPO):
         actor: ULTActorModel,
         critic: MLPModel,
         storage: RolloutStorage,
+        lr_cosine_iterations: int,
         ult_mix_alpha: float = 0.6,
         ult_aux_lambda: float = 1.0,
         ult_beta: float = 1.0,
@@ -200,43 +195,35 @@ class ULTPPO(PPO):
         self.ult_mix_alpha = ult_mix_alpha
         self.ult_aux_lambda = ult_aux_lambda
         self.ult_beta = ult_beta
+        self.lr_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(self.optimizer, T_max=lr_cosine_iterations)
+        self.is_teacher = torch.rand((storage.num_envs, 1), device=self.device) < self.ult_mix_alpha
 
     def act(self, obs: TensorDict) -> torch.Tensor:
         self.transition.hidden_states = (self.actor.get_hidden_state(), self.critic.get_hidden_state())
-        student_out, teacher_out, _ = self.actor.forward_heads(obs)
-        is_teacher = torch.rand((student_out.shape[0], 1), device=self.device) < self.ult_mix_alpha
-        self.actor.distribution.update(torch.where(is_teacher, teacher_out, student_out))
+        _, student_action, teacher_action = self.actor.forward_heads(obs)
+        self.actor.distribution.update(torch.where(self.is_teacher, teacher_action, student_action))
         self.transition.actions = self.actor.distribution.sample().detach()
         self.transition.values = self.critic(obs).detach()
         self.transition.actions_log_prob = self.actor.get_output_log_prob(self.transition.actions).detach()
         self.transition.distribution_params = tuple(p.detach() for p in self.actor.output_distribution_params)
         self.transition.observations = obs.copy()
-        self.transition.observations[EXECUTED_TEACHER_KEY] = is_teacher
+        self.transition.observations[EXECUTED_TEACHER_KEY] = self.is_teacher
         return self.transition.actions
 
-    def process_env_step(
-        self, obs: TensorDict, rewards: torch.Tensor, dones: torch.Tensor, extras: dict[str, torch.Tensor]
-    ) -> None:
-        # The environment writes the executed action into the newest action token, beside the proprio it produced.
-        nsa_target = torch.cat((obs["proprio_history"][:, -1], obs["action_history"][:, -1]), dim=-1)
-        self.transition.observations[NSA_TARGET_KEY] = nsa_target
-        self.transition.observations[NSA_VALID_KEY] = dones.reshape(-1, 1) == 0
-        super().process_env_step(obs, rewards, dones, extras)
-
     def update(self) -> dict[str, float]:
-        mean_nsa = 0.0
-        mean_imitation = 0.0
-        mean_value_loss = 0
-        mean_surrogate_loss = 0
-        mean_entropy = 0
+        mean_value_loss = 0.0
+        mean_surrogate_loss = 0.0
+        mean_entropy = 0.0
+        mean_next_state_action_loss = 0.0
+        mean_imitation_loss = 0.0
         generator = self.storage.mini_batch_generator(self.num_mini_batches, self.num_learning_epochs)
         for batch in generator:
             if self.normalize_advantage_per_mini_batch:
                 with torch.no_grad():
                     batch.advantages = (batch.advantages - batch.advantages.mean()) / (batch.advantages.std() + 1e-8)
             obs = batch.observations
-            student_out, teacher_out, nsa = self.actor.forward_heads(obs)
-            self.actor.distribution.update(torch.where(obs[EXECUTED_TEACHER_KEY], teacher_out, student_out))
+            next_tokens, student_action, teacher_action = self.actor.forward_heads(obs)
+            self.actor.distribution.update(torch.where(obs[EXECUTED_TEACHER_KEY], teacher_action, student_action))
             actions_log_prob = self.actor.get_output_log_prob(batch.actions)
             entropy = self.actor.output_entropy
             values = self.critic(obs)
@@ -253,17 +240,13 @@ class ULTPPO(PPO):
                 value_loss = torch.max(value_losses, value_losses_clipped).mean()
             else:
                 value_loss = (batch.returns - values).pow(2).mean()
-            is_nsa_valid = obs[NSA_VALID_KEY]
-            nsa_error = (nsa - obs[NSA_TARGET_KEY]).pow(2).mean(dim=-1, keepdim=True)
-            nsa_loss = (nsa_error * is_nsa_valid).sum() / is_nsa_valid.sum().clamp(min=1)
-            student_mean = self.actor.distribution.deterministic_output(student_out)
-            teacher_mean = self.actor.distribution.deterministic_output(teacher_out)
-            imitation_loss = (student_mean - teacher_mean).pow(2).mean()
+            next_state_action_loss = (ult_tokens(obs)[:, 1:] - next_tokens[:, :-1]).square().sum(dim=-1).mean()
+            imitation_loss = (teacher_action - student_action).square().sum(dim=-1).mean()
             loss = (
                 surrogate_loss
                 + self.value_loss_coef * value_loss
                 - self.entropy_coef * entropy.mean()
-                + self.ult_aux_lambda * (nsa_loss + self.ult_beta * imitation_loss)
+                + self.ult_aux_lambda * (next_state_action_loss + self.ult_beta * imitation_loss)
             )
             self.optimizer.zero_grad()
             loss.backward()
@@ -275,73 +258,42 @@ class ULTPPO(PPO):
             mean_value_loss += value_loss.item()
             mean_surrogate_loss += surrogate_loss.item()
             mean_entropy += entropy.mean().item()
-            mean_nsa += nsa_loss.item()
-            mean_imitation += imitation_loss.item()
-        num_updates = self.num_learning_epochs * self.num_mini_batches
+            mean_next_state_action_loss += next_state_action_loss.item()
+            mean_imitation_loss += imitation_loss.item()
+        self.lr_scheduler.step()
+        self.learning_rate = self.optimizer.param_groups[0]["lr"]
+        self.is_teacher = torch.rand((self.storage.num_envs, 1), device=self.device) < self.ult_mix_alpha
         self.storage.clear()
+        num_updates = self.num_learning_epochs * self.num_mini_batches
         return {
             "value": mean_value_loss / num_updates,
             "surrogate": mean_surrogate_loss / num_updates,
             "entropy": mean_entropy / num_updates,
-            "ult_nsa": mean_nsa / num_updates,
-            "ult_imitation": mean_imitation / num_updates,
+            "ult_next_state_action": mean_next_state_action_loss / num_updates,
+            "ult_imitation": mean_imitation_loss / num_updates,
         }
+
+    def save(self) -> dict:
+        saved_dict = super().save()
+        saved_dict["lr_scheduler_state_dict"] = self.lr_scheduler.state_dict()
+        return saved_dict
+
+    def load(self, loaded_dict: dict, load_cfg: dict | None, strict: bool) -> bool:
+        load_iteration = super().load(loaded_dict, load_cfg, strict)
+        self.lr_scheduler.load_state_dict(loaded_dict["lr_scheduler_state_dict"])
+        return load_iteration
 
     @staticmethod
     def construct_algorithm(obs: TensorDict, env: VecEnv, cfg: dict, device: str) -> "ULTPPO":
         alg_class, alg_cfg = resolve_class(cfg["algorithm"])
         actor_class, actor_cfg = resolve_class(cfg["actor"])
         critic_class, critic_cfg = resolve_class(cfg["critic"])
-        default_sets = ["actor", "critic"]
-        cfg["obs_groups"] = resolve_obs_groups(obs, cfg["obs_groups"], default_sets)
+        cfg["obs_groups"] = resolve_obs_groups(obs, cfg["obs_groups"], ["actor", "critic"])
         actor: ULTActorModel = actor_class(obs, cfg["obs_groups"], "actor", env.num_actions, **actor_cfg).to(device)
         critic: MLPModel = critic_class(obs, cfg["obs_groups"], "critic", 1, **critic_cfg).to(device)
         storage_obs = obs.copy()
         storage_obs[EXECUTED_TEACHER_KEY] = torch.zeros((env.num_envs, 1), dtype=torch.bool, device=obs.device)
-        storage_obs[NSA_TARGET_KEY] = torch.zeros((env.num_envs, ULT_TOKEN_DIM), dtype=gs.tc_float, device=obs.device)
-        storage_obs[NSA_VALID_KEY] = torch.zeros((env.num_envs, 1), dtype=torch.bool, device=obs.device)
         storage = RolloutStorage("rl", env.num_envs, cfg["num_steps_per_env"], storage_obs, [env.num_actions], device)
         alg: ULTPPO = alg_class(actor, critic, storage, device=device, **alg_cfg, multi_gpu_cfg=cfg["multi_gpu"])
         alg.compile(cfg.get("torch_compile_mode"))
         return alg
-
-
-class ULTRunner(OnPolicyRunner):
-    """On-policy runner for the ULT transformer policy."""
-
-    def learn(self, num_learning_iterations, init_at_random_ep_len=False):
-        if not self.env.is_ult_policy:
-            raise gs.GenesisException("ULTRunner requires env_cfg['policy'] == 'ult'.")
-        cosine = torch.optim.lr_scheduler.CosineAnnealingLR(
-            self.alg.optimizer,
-            T_max=num_learning_iterations,
-            eta_min=self.alg.learning_rate * 0.1,
-        )
-        next_it = self.current_learning_iteration
-        if self.env._speed_level is not None:
-            print(format_speed_curriculum(SPEED_VX_CAPS[self.env._speed_level], next_it, None), flush=True)
-
-        def step_scheduler(loss_dict):
-            nonlocal next_it
-            cosine.step()
-            promoted = self.env.advance_speed_cap()
-            if promoted is not None:
-                vx_max, tracking = promoted
-                print(format_speed_curriculum(vx_max, next_it, tracking), flush=True)
-            next_it += 1
-            return loss_dict
-
-        update = self.alg.update
-        self.alg.update = lambda: step_scheduler(update())
-        super().learn(num_learning_iterations, init_at_random_ep_len)
-
-    def get_inference_policy(self, device=None):
-        device = device or self.device
-        self.alg.eval_mode()
-
-        def policy(obs):
-            obs = obs.to(device)
-            with torch.inference_mode():
-                return self.alg.actor(obs, stochastic_output=False)
-
-        return policy

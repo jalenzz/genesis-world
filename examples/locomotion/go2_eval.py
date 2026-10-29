@@ -15,8 +15,7 @@ except (metadata.PackageNotFoundError, ImportError, ValueError) as e:
 import genesis as gs
 
 from dreamwaq import CurriculumRunner
-from go2_env import TERRAIN_KINDS, Go2Env, is_ult_policy
-from ult import ULTRunner
+from go2_env import TERRAIN_KINDS, Go2Env
 
 
 def make_eval_env(
@@ -41,6 +40,8 @@ def make_eval_env(
     with open(f"logs/{exp_name}/cfgs.pkl", "rb") as f:
         env_cfg, obs_cfg, reward_cfg, command_cfg, train_cfg = pickle.load(f)
     reward_cfg["reward_scales"] = {}
+    # A heading command rewrites the yaw rate every step, which would override the yaw rate pinned here.
+    command_cfg.pop("heading_range", None)
     if terrain != "config":
         env_cfg["terrain"] = terrain
     terrain_kind = env_cfg.get("terrain", "plane")
@@ -85,15 +86,11 @@ def load_policy(env, env_cfg, train_cfg, exp_name, ckpt):
     """
     log_dir = f"logs/{exp_name}"
     ckpt_path = os.path.join(log_dir, f"model_{ckpt}.pt")
-    if is_ult_policy(env_cfg):
-        runner = ULTRunner(env, train_cfg, log_dir, device=gs.device)
-        runner.load(ckpt_path)
-    else:
-        runner = CurriculumRunner(env, train_cfg, log_dir, device=gs.device)
-        runner.load(
-            ckpt_path,
-            load_cfg={"actor": True, "estimator": True, "speed_curriculum": env_cfg.get("speed_curriculum")},
-        )
+    runner = CurriculumRunner(env, train_cfg, log_dir, device=gs.device)
+    runner.load(
+        ckpt_path,
+        load_cfg={"actor": True, "estimator": True, "speed_curriculum": env_cfg.get("speed_curriculum")},
+    )
     return runner.get_inference_policy(device=gs.device), ckpt_path
 
 
