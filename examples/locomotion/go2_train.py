@@ -9,17 +9,25 @@ try:
         raise ImportError
 except (metadata.PackageNotFoundError, ImportError) as e:
     raise ImportError("Please install 'rsl-rl-lib>=5.0.0'.") from e
-from rsl_rl.runners import OnPolicyRunner
 
 import genesis as gs
 
-from go2_env import Go2Env
+from dreamwaq import CurriculumRunner
+from go2_env import (
+    POLICY_DREAMWAQ,
+    POLICY_MLP,
+    Go2Env,
+    apply_curriculum,
+    is_dreamwaq_policy,
+    locomotion_cfgs,
+    policy_obs_groups,
+)
 
 
 def get_train_cfg(exp_name):
     train_cfg_dict = {
         "algorithm": {
-            "class_name": "PPO",
+            "class_name": "dreamwaq:CurriculumPPO",
             "clip_param": 0.2,
             "desired_kl": 0.01,
             "entropy_coef": 0.01,
@@ -61,82 +69,17 @@ def get_train_cfg(exp_name):
     return train_cfg_dict
 
 
-def get_cfgs():
-    env_cfg = {
-        "num_actions": 12,
-        # joint/link names
-        "default_joint_angles": {  # [rad]
-            "FL_hip_joint": 0.0,
-            "FR_hip_joint": 0.0,
-            "RL_hip_joint": 0.0,
-            "RR_hip_joint": 0.0,
-            "FL_thigh_joint": 0.8,
-            "FR_thigh_joint": 0.8,
-            "RL_thigh_joint": 1.0,
-            "RR_thigh_joint": 1.0,
-            "FL_calf_joint": -1.5,
-            "FR_calf_joint": -1.5,
-            "RL_calf_joint": -1.5,
-            "RR_calf_joint": -1.5,
-        },
-        "joint_names": [
-            "FR_hip_joint",
-            "FR_thigh_joint",
-            "FR_calf_joint",
-            "FL_hip_joint",
-            "FL_thigh_joint",
-            "FL_calf_joint",
-            "RR_hip_joint",
-            "RR_thigh_joint",
-            "RR_calf_joint",
-            "RL_hip_joint",
-            "RL_thigh_joint",
-            "RL_calf_joint",
-        ],
-        # PD
-        "kp": 20.0,
-        "kd": 0.5,
-        # termination
-        "termination_if_roll_greater_than": 10,  # degree
-        "termination_if_pitch_greater_than": 10,
-        # base pose
-        "base_init_pos": [0.0, 0.0, 0.42],
-        "base_init_quat": [1.0, 0.0, 0.0, 0.0],
-        "episode_length_s": 20.0,
-        "resampling_time_s": 4.0,
-        "action_scale": 0.25,
-        "simulate_action_latency": True,
-        "clip_actions": 100.0,
-    }
-    obs_cfg = {
-        "obs_scales": {
-            "lin_vel": 2.0,
-            "ang_vel": 0.25,
-            "dof_pos": 1.0,
-            "dof_vel": 0.05,
-        },
-    }
-    reward_cfg = {
-        "tracking_sigma": 0.25,
-        "base_height_target": 0.3,
-        "feet_height_target": 0.075,
-        "reward_scales": {
-            "tracking_lin_vel": 1.0,
-            "tracking_ang_vel": 0.2,
-            "lin_vel_z": -1.0,
-            "base_height": -50.0,
-            "action_rate": -0.005,
-            "similar_to_default": -0.1,
-        },
-    }
-    command_cfg = {
-        "num_commands": 3,
-        "lin_vel_x_range": [0.5, 0.5],
-        "lin_vel_y_range": [0, 0],
-        "ang_vel_range": [0, 0],
-    }
+def configure_train_cfg(exp_name, env_cfg):
+    """Return the runner config, with DreamWaQ observation groups when that policy is selected.
 
-    return env_cfg, obs_cfg, reward_cfg, command_cfg
+    The DreamWaQ actor and critic normalize their inputs to zero mean and unit variance.
+    """
+    train_cfg = get_train_cfg(exp_name)
+    train_cfg["obs_groups"] = policy_obs_groups(env_cfg)
+    if is_dreamwaq_policy(env_cfg):
+        train_cfg["actor"]["obs_normalization"] = True
+        train_cfg["critic"]["obs_normalization"] = True
+    return train_cfg
 
 
 def main():
@@ -146,19 +89,108 @@ def main():
     )
     parser.add_argument("-b", "--num-envs", type=int, default=4096, help="Number of parallel environments")
     parser.add_argument("--max-iterations", type=int, default=101, help="Number of learning iterations")
+    parser.add_argument(
+        "--resume",
+        type=str,
+        default="",
+        help=(
+            "Checkpoint to load. Learning continues after it with the configs saved in the log directory, the "
+            "curricula and the context estimator included, and the log directory keeps its earlier files."
+        ),
+    )
+    parser.add_argument(
+        "--learning-rate",
+        type=float,
+        default=None,
+        help="PPO learning rate. When resuming, this replaces the checkpoint rate and the schedule stays fixed.",
+    )
     parser.add_argument("--seed", type=int, default=1, help="Random seed")
+    parser.add_argument(
+        "--terrain-levels",
+        type=int,
+        default=None,
+        help=(
+            "Easiest curriculum rows to build. Each row keeps the slope it has in the 10-row curriculum, and the "
+            "harder rows are left unbuilt. The default builds all 10 rows."
+        ),
+    )
+    parser.add_argument(
+        "--vx-max",
+        type=float,
+        default=None,
+        help=(
+            "Fixed upper end of the forward command, in m/s. Sampling uses [-1, this value] for the whole run. The "
+            "default starts the upper end at 1 and raises it with tracking, up to 2."
+        ),
+    )
+    parser.add_argument(
+        "--terrain",
+        choices=("plane", "curriculum"),
+        default=None,
+        help=(
+            "Ground under the robot, 'curriculum' by default. 'curriculum' starts vx in [-1, 1] and raises the upper "
+            "end with tracking, draws vy from [-0.5, 0.5] and yaw from [-1, 1], and moves each terrain row up or down "
+            "from tracking. 'plane' keeps the flat walker and its fixed forward command. A resume must match the "
+            "saved value."
+        ),
+    )
+    parser.add_argument(
+        "--policy",
+        choices=(POLICY_MLP, POLICY_DREAMWAQ),
+        default=None,
+        help=(
+            "Actor policy. Defaults to dreamwaq with --terrain curriculum and mlp with plane. A resume must match the "
+            "saved value."
+        ),
+    )
     args = parser.parse_args()
+    if args.resume and (args.terrain_levels is not None or args.vx_max is not None):
+        raise SystemExit("A resumed run keeps its saved terrain rows and forward command.")
+    if args.terrain_levels is not None and args.terrain_levels < 1:
+        raise SystemExit("--terrain-levels must be at least 1.")
 
     log_dir = f"logs/{args.exp_name}"
-    env_cfg, obs_cfg, reward_cfg, command_cfg = get_cfgs()
-    train_cfg = get_train_cfg(args.exp_name)
-
-    if os.path.exists(log_dir):
-        shutil.rmtree(log_dir)
-    os.makedirs(log_dir, exist_ok=True)
-
-    with open(f"{log_dir}/cfgs.pkl", "wb") as f:
-        pickle.dump([env_cfg, obs_cfg, reward_cfg, command_cfg, train_cfg], f)
+    if args.resume:
+        with open(f"{log_dir}/cfgs.pkl", "rb") as f:
+            env_cfg, obs_cfg, reward_cfg, command_cfg, train_cfg = pickle.load(f)
+        saved_terrain = env_cfg.get("terrain", "plane")
+        saved_policy = env_cfg.get("policy", POLICY_MLP)
+        if args.terrain not in (None, saved_terrain) or args.policy not in (None, saved_policy):
+            raise SystemExit(
+                f"--terrain {args.terrain} --policy {args.policy} differ from the saved terrain '{saved_terrain}' "
+                f"and policy '{saved_policy}' of {log_dir}."
+            )
+    else:
+        terrain = "curriculum" if args.terrain is None else args.terrain
+        env_cfg, obs_cfg, reward_cfg, command_cfg = locomotion_cfgs()
+        if terrain == "curriculum":
+            apply_curriculum(env_cfg, reward_cfg, command_cfg)
+        if args.policy is not None:
+            env_cfg["policy"] = args.policy
+        elif terrain == "curriculum":
+            env_cfg["policy"] = POLICY_DREAMWAQ
+        else:
+            env_cfg["policy"] = POLICY_MLP
+        if args.terrain_levels is not None:
+            if terrain != "curriculum":
+                raise SystemExit("--terrain-levels applies to the terrain curriculum.")
+            # Row i keeps the slope it has when 10 rows share the full slope. See difficulty_levels.
+            env_cfg["terrain_difficulty_levels"] = 10
+            env_cfg["terrain_levels"] = args.terrain_levels
+        if args.vx_max is not None:
+            if terrain != "curriculum":
+                raise SystemExit("--vx-max applies to the terrain curriculum.")
+            env_cfg["speed_curriculum"] = False
+            command_cfg["lin_vel_x_range"][1] = args.vx_max
+        train_cfg = configure_train_cfg(args.exp_name, env_cfg)
+        if args.learning_rate is not None:
+            train_cfg["algorithm"]["learning_rate"] = args.learning_rate
+            train_cfg["algorithm"]["schedule"] = "fixed"
+        if os.path.exists(log_dir):
+            shutil.rmtree(log_dir)
+        os.makedirs(log_dir)
+        with open(f"{log_dir}/cfgs.pkl", "wb") as f:
+            pickle.dump([env_cfg, obs_cfg, reward_cfg, command_cfg, train_cfg], f)
 
     # Training throughput comes from the 4096 parallel environments, which need a GPU.
     gs.init(backend=gs.gpu, precision="32", logging_level="warning", seed=args.seed, performance_mode=True)
@@ -167,7 +199,18 @@ def main():
         num_envs=args.num_envs, env_cfg=env_cfg, obs_cfg=obs_cfg, reward_cfg=reward_cfg, command_cfg=command_cfg
     )
 
-    runner = OnPolicyRunner(env, train_cfg, log_dir, device=gs.device)
+    runner = CurriculumRunner(env, train_cfg, log_dir, device=gs.device)
+    if args.resume:
+        runner.load(args.resume)
+        # The file stores the iteration just finished. The learning loop starts at that index.
+        runner.current_learning_iteration += 1
+        # Loading restores the adaptive rate from the checkpoint. The requested rate replaces that value,
+        # and a fixed schedule keeps later updates from changing it.
+        if args.learning_rate is not None:
+            runner.alg.schedule = "fixed"
+            runner.alg.learning_rate = args.learning_rate
+            for param_group in runner.alg.optimizer.param_groups:
+                param_group["lr"] = args.learning_rate
 
     runner.learn(num_learning_iterations=args.max_iterations, init_at_random_ep_len=True)
 
@@ -176,6 +219,10 @@ if __name__ == "__main__":
     main()
 
 """
-# training
-python examples/locomotion/go2_train.py
+# training. Forward speed starts in [-1, 1] and its upper end rises with tracking.
+# Lateral speed is sampled from [-0.5, 0.5], yaw from [-1, 1]. Terrain rows move with tracking.
+python examples/locomotion/go2_train.py -e go2-cmd-terrain
+
+# training, flat ground and a fixed forward command
+python examples/locomotion/go2_train.py -e go2-plane --terrain plane
 """

@@ -80,6 +80,10 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+examples = [
+    # Xbox pad axis reads for the Go2 locomotion teleop
+    "pygame>=2.5.0",
+]
 dev = [
     "black",
     "pytest",
