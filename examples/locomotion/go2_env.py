@@ -285,14 +285,16 @@ def apply_curriculum(env_cfg, reward_cfg, command_cfg=None):
         command_cfg["ang_vel_range"] = [-1.0, 1.0]
 
 
-def build_curriculum_height_field(n_levels, subterrain_size, horizontal_scale, vertical_scale, max_slope_deg):
+def build_curriculum_height_field(
+    n_levels, subterrain_size, horizontal_scale, vertical_scale, max_slope_deg, difficulty_levels=None
+):
     """Build the height field of the tracking curriculum.
 
-    Each row is one difficulty. Smooth and rough slopes use angle `row / (n_levels - 1) * max_slope_deg`. Discrete
-    obstacles and stairs use the square of that fraction, so early rows stay near flat and the last row still reaches
-    the full obstacle height and the same slope. The columns are a smooth pyramid slope, the same slope plus height
+    Each row is one difficulty. Smooth and rough slopes use angle `row / (difficulty_levels - 1) * max_slope_deg`.
+    `difficulty_levels` defaults to `n_levels`, so the last built row is the full slope. Discrete obstacles and
+    stairs use the square of that fraction. The columns are a smooth pyramid slope, the same slope plus height
     noise, discrete obstacles, and pyramid stairs. The value at each grid point is the discrete height the terrain
-    morph scales by `vertical_scale`.
+    morph scales by `vertical_scale`. A field of one row is flat.
     """
     n_types = len(TERRAIN_KINDS)
     subterrain_rows = int(subterrain_size[0] / horizontal_scale + gs.EPS) + 1
@@ -308,10 +310,12 @@ def build_curriculum_height_field(n_levels, subterrain_size, horizontal_scale, v
     step_width = horizontal_scale * 2.0
     min_obstacle = horizontal_scale * 4.0
     max_obstacle = max(min_obstacle, min(subterrain_size[0] * 0.45, horizontal_scale * 12.0))
+    difficulty_count = n_levels if difficulty_levels is None else difficulty_levels
+    difficulty_span = difficulty_count - 1
     saved_state = np.random.get_state()
     try:
         for level in range(n_levels):
-            difficulty = level / (n_levels - 1)
+            difficulty = 0.0 if difficulty_span == 0 else level / difficulty_span
             slope = math.tan(math.radians(max_slope_deg * difficulty))
             eased = difficulty * difficulty
             eased_slope = math.tan(math.radians(max_slope_deg * eased))
@@ -399,6 +403,8 @@ class Go2Env:
         self._curriculum_up = env_cfg.get("curriculum_up", 0.8)
         self._curriculum_down = env_cfg.get("curriculum_down", 0.25)
         self._n_levels = env_cfg.get("terrain_levels", 10)
+        # See difficulty_levels in build_curriculum_height_field. A shorter mesh can keep that slope.
+        self._difficulty_levels = env_cfg.get("terrain_difficulty_levels", self._n_levels)
         self._subterrain_size = env_cfg.get("terrain_subterrain_size", (8.0, 8.0))
         self._horizontal_scale = env_cfg.get("terrain_horizontal_scale", 0.25)
         self._vertical_scale = env_cfg.get("terrain_vertical_scale", 0.005)
@@ -455,6 +461,7 @@ class Go2Env:
                         self._horizontal_scale,
                         self._vertical_scale,
                         self._max_slope_deg,
+                        difficulty_levels=self._difficulty_levels,
                     ),
                     horizontal_scale=self._horizontal_scale,
                     vertical_scale=self._vertical_scale,
@@ -596,6 +603,10 @@ class Go2Env:
         level_weights = other_level_weights.unsqueeze(0).repeat(len(TERRAIN_KINDS), 1)
         level_weights[TERRAIN_KINDS.index("smooth_slope")] = smooth_level_weights
         self.terrain_levels = torch.multinomial(level_weights[self.terrain_types], num_samples=1).squeeze(1)
+        # A set row replaces the sampled row before the first reset.
+        initial_level = env_cfg.get("initial_terrain_level")
+        if initial_level is not None:
+            self.terrain_levels.fill_(initial_level)
         self._promote_streak = torch.zeros((self._batch_n,), dtype=gs.tc_int, device=gs.device)
         self._obstacle_kind = TERRAIN_KINDS.index("discrete_obstacles")
         self._stair_kind = TERRAIN_KINDS.index("stairs")

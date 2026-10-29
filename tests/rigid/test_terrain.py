@@ -462,18 +462,42 @@ def test_multicontact_sphere_vs_terrain(show_viewer, tol):
 
 @pytest.mark.parametrize("n_envs", [0, 2])
 def test_curriculum_terrain_tracking(n_envs, show_viewer):
+    subterrain_size = (4.0, 4.0)
+    horizontal_scale = 0.5
+    vertical_scale = 0.01
+    max_slope_deg = 22.0
+    full_field = go2_locomotion_env.build_curriculum_height_field(
+        n_levels=10,
+        subterrain_size=subterrain_size,
+        horizontal_scale=horizontal_scale,
+        vertical_scale=vertical_scale,
+        max_slope_deg=max_slope_deg,
+    )
+    kept_field = go2_locomotion_env.build_curriculum_height_field(
+        n_levels=3,
+        subterrain_size=subterrain_size,
+        horizontal_scale=horizontal_scale,
+        vertical_scale=vertical_scale,
+        max_slope_deg=max_slope_deg,
+        difficulty_levels=10,
+    )
+    assert kept_field.shape[0] < full_field.shape[0]
+    assert kept_field.shape[1] == full_field.shape[1]
+    # The last grid row is the edge shared with the next difficulty row.
+    assert_equal(kept_field[:-1], full_field[: kept_field.shape[0] - 1])
+
     env_cfg, obs_cfg, reward_cfg, command_cfg = go2_locomotion_env.locomotion_cfgs()
     go2_locomotion_env.apply_curriculum(env_cfg, reward_cfg)
     env_cfg["policy"] = go2_locomotion_env.POLICY_DREAMWAQ
-    subterrain_size = (4.0, 4.0)
     env_cfg["episode_length_s"] = 1.0
     env_cfg["termination_if_roll_greater_than"] = 180
     env_cfg["termination_if_pitch_greater_than"] = 180
     env_cfg["curriculum_up"] = 0.5
     env_cfg["curriculum_down"] = 0.05
     env_cfg["terrain_subterrain_size"] = subterrain_size
-    env_cfg["terrain_horizontal_scale"] = 0.5
-    env_cfg["terrain_vertical_scale"] = 0.01
+    env_cfg["terrain_horizontal_scale"] = horizontal_scale
+    env_cfg["terrain_vertical_scale"] = vertical_scale
+    env_cfg["terrain_max_slope_deg"] = max_slope_deg
     env_cfg["randomization"] = dict(
         friction=(0.8, 1.2),
         mass_scale=(0.9, 1.1),
