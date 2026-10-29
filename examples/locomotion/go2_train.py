@@ -106,6 +106,24 @@ def main():
     )
     parser.add_argument("--seed", type=int, default=1, help="Random seed")
     parser.add_argument(
+        "--terrain-levels",
+        type=int,
+        default=None,
+        help=(
+            "Easiest curriculum rows to build. Each row keeps the slope it has in the 10-row curriculum, and the "
+            "harder rows are left unbuilt. The default builds all 10 rows."
+        ),
+    )
+    parser.add_argument(
+        "--vx-max",
+        type=float,
+        default=None,
+        help=(
+            "Fixed upper end of the forward command, in m/s. Sampling uses [-1, this value] for the whole run. The "
+            "default starts the upper end at 1 and raises it with tracking, up to 2."
+        ),
+    )
+    parser.add_argument(
         "--terrain",
         choices=("plane", "curriculum"),
         default=None,
@@ -126,6 +144,10 @@ def main():
         ),
     )
     args = parser.parse_args()
+    if args.resume and (args.terrain_levels is not None or args.vx_max is not None):
+        raise SystemExit("A resumed run keeps its saved terrain rows and forward command.")
+    if args.terrain_levels is not None and args.terrain_levels < 1:
+        raise SystemExit("--terrain-levels must be at least 1.")
 
     log_dir = f"logs/{args.exp_name}"
     if args.resume:
@@ -149,6 +171,17 @@ def main():
             env_cfg["policy"] = POLICY_DREAMWAQ
         else:
             env_cfg["policy"] = POLICY_MLP
+        if args.terrain_levels is not None:
+            if terrain != "curriculum":
+                raise SystemExit("--terrain-levels applies to the terrain curriculum.")
+            # Row i keeps the slope it has when 10 rows share the full slope. See difficulty_levels.
+            env_cfg["terrain_difficulty_levels"] = 10
+            env_cfg["terrain_levels"] = args.terrain_levels
+        if args.vx_max is not None:
+            if terrain != "curriculum":
+                raise SystemExit("--vx-max applies to the terrain curriculum.")
+            env_cfg["speed_curriculum"] = False
+            command_cfg["lin_vel_x_range"][1] = args.vx_max
         train_cfg = configure_train_cfg(args.exp_name, env_cfg)
         if args.learning_rate is not None:
             train_cfg["algorithm"]["learning_rate"] = args.learning_rate
