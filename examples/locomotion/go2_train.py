@@ -16,12 +16,19 @@ from dreamwaq import DreamWaQRunner, SpeedCurriculumRunner
 from go2_env import (
     POLICY_DREAMWAQ,
     POLICY_MLP,
+    POLICY_ULT,
+    ULT_HISTORY_STEPS,
     Go2Env,
     apply_curriculum,
+    apply_ult,
     is_dreamwaq_policy,
+    is_ult_policy,
     locomotion_cfgs,
     policy_obs_groups,
 )
+
+# Transitions per PPO minibatch of the ULT policy.
+ULT_MINIBATCH_SIZE = 16384
 
 
 def get_train_cfg(exp_name):
@@ -69,8 +76,54 @@ def get_train_cfg(exp_name):
     return train_cfg_dict
 
 
-def configure_train_cfg(exp_name, env_cfg):
-    """Return the runner config, with DreamWaQ observation groups when that policy is selected."""
+def configure_ult_train_cfg(exp_name, env_cfg, num_envs, max_iterations):
+    """Return the runner config of the ULT policy, with the PPO hyperparameters of the ULT paper.
+
+    The rollout of ``num_envs`` environments is split into minibatches of 16384 transitions, and the learning rate
+    decays along a cosine over ``max_iterations`` updates.
+    """
+    train_cfg = get_train_cfg(exp_name)
+    train_cfg["obs_groups"] = policy_obs_groups(env_cfg)
+    train_cfg["algorithm"] = {
+        "class_name": "ult:ULTPPO",
+        "clip_param": 0.2,
+        "entropy_coef": 0.005,
+        "gamma": 0.99,
+        "lam": 0.95,
+        "learning_rate": 3.0e-3,
+        "lr_cosine_iterations": max_iterations,
+        "max_grad_norm": 1.0,
+        "num_learning_epochs": 5,
+        "num_mini_batches": max(1, num_envs * train_cfg["num_steps_per_env"] // ULT_MINIBATCH_SIZE),
+        "optimizer": "adamw",
+        "schedule": "fixed",
+        "use_clipped_value_loss": True,
+        "value_loss_coef": 1.0,
+        "ult_mix_alpha": 0.6,
+        "ult_aux_lambda": 1.0,
+        "ult_beta": 1.0,
+    }
+    train_cfg["actor"] = {
+        "class_name": "ult:ULTActorModel",
+        "history_steps": ULT_HISTORY_STEPS,
+        "distribution_cfg": {
+            "class_name": "GaussianDistribution",
+            "init_std": 1.0,
+            "std_type": "scalar",
+        },
+    }
+    train_cfg["critic"] = {
+        "class_name": "MLPModel",
+        "hidden_dims": [512, 256, 128],
+        "activation": "elu",
+    }
+    return train_cfg
+
+
+def configure_train_cfg(exp_name, env_cfg, num_envs, max_iterations):
+    """Return the runner config for the selected walking policy."""
+    if is_ult_policy(env_cfg):
+        return configure_ult_train_cfg(exp_name, env_cfg, num_envs, max_iterations)
     train_cfg = get_train_cfg(exp_name)
     train_cfg["obs_groups"] = policy_obs_groups(env_cfg)
     return train_cfg
@@ -108,7 +161,7 @@ def main():
     )
     parser.add_argument(
         "--policy",
-        choices=(POLICY_MLP, POLICY_DREAMWAQ),
+        choices=(POLICY_MLP, POLICY_DREAMWAQ, POLICY_ULT),
         default=None,
         help="Actor policy. Defaults to dreamwaq with --terrain curriculum and mlp with plane.",
     )
@@ -118,13 +171,17 @@ def main():
     env_cfg, obs_cfg, reward_cfg, command_cfg = locomotion_cfgs()
     if args.terrain == "curriculum":
         apply_curriculum(env_cfg, reward_cfg, command_cfg)
-    if args.policy is not None:
+    if args.policy == POLICY_ULT:
+        if args.terrain != "curriculum":
+            parser.error("--policy ult trains on the terrain curriculum.")
+        apply_ult(env_cfg, reward_cfg, command_cfg)
+    elif args.policy is not None:
         env_cfg["policy"] = args.policy
     elif args.terrain == "curriculum":
         env_cfg["policy"] = POLICY_DREAMWAQ
     else:
         env_cfg["policy"] = POLICY_MLP
-    train_cfg = configure_train_cfg(args.exp_name, env_cfg)
+    train_cfg = configure_train_cfg(args.exp_name, env_cfg, args.num_envs, args.max_iterations)
     if args.learning_rate is not None:
         train_cfg["algorithm"]["learning_rate"] = args.learning_rate
         train_cfg["algorithm"]["schedule"] = "fixed"
@@ -171,4 +228,7 @@ python examples/locomotion/go2_train.py -e go2-cmd-terrain
 
 # training, flat ground and a fixed forward command
 python examples/locomotion/go2_train.py -e go2-plane --terrain plane
+
+# ULT on the terrain curriculum
+python examples/locomotion/go2_train.py -e go2-ult --policy ult --terrain curriculum
 """

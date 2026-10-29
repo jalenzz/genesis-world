@@ -56,6 +56,13 @@ class DomainRandomization(NamedTuple):
     system_delay: tuple[float, float] = (0.0, 0.0)
     # Absolute friction coefficient. None keeps `friction` as a ratio of the authored coefficient.
     friction_coefficient: tuple[float, float] | None = None
+    # Damping gain scale drawn apart from the stiffness scale. None applies `gain_scale` to both gains.
+    kd_scale: tuple[float, float] | None = None
+    # Offset of the base center of mass in each axis, in meters, on top of `com_offset`.
+    payload_com_offset: float = 0.0
+    # Base velocity change in each horizontal axis, in m/s, applied once every `push_interval_s` of an episode.
+    push_vel_xy: float = 0.0
+    push_interval_s: float = 15.0
 
 
 DEFAULT_RANDOMIZATION = DomainRandomization(
@@ -71,9 +78,36 @@ DEFAULT_RANDOMIZATION = DomainRandomization(
 )
 
 FOOT_LINK_NAMES = ("FR_foot", "FL_foot", "RR_foot", "RL_foot")
+# Links whose contact with the ground counts as a collision in the reward.
+COLLISION_LINK_NAMES = (
+    "FR_thigh",
+    "FR_calf",
+    "FL_thigh",
+    "FL_calf",
+    "RR_thigh",
+    "RR_calf",
+    "RL_thigh",
+    "RL_calf",
+)
+# Net contact force, in newtons, above which a link counts as touching.
+CONTACT_FORCE_THRESHOLD = 1.0
+# Yaw rate command per radian of heading error, before the command range clips it.
+HEADING_GAIN = 0.5
 
 POLICY_MLP = "mlp"
 POLICY_DREAMWAQ = "dreamwaq"
+POLICY_ULT = "ult"
+ULT_HISTORY_STEPS = 15
+ULT_PROPRIO_DIM = 37
+# Height map sample offsets in the yaw-aligned base frame: 17 x 11 points over 1.6 m x 1.0 m.
+ULT_HEIGHTMAP_X = tuple(np.linspace(-0.8, 0.8, 17))
+ULT_HEIGHTMAP_Y = tuple(np.linspace(-0.5, 0.5, 11))
+# Stiffness, damping and motor strength scales per motor, friction ratio per foot, payload, payload center of mass
+# offset, gravity scale and system delay.
+ULT_DOMAIN_PRIV_DIM = 3 * 12 + len(FOOT_LINK_NAMES) + 1 + 3 + 1 + 1
+# Base linear and angular velocity, roll, pitch and yaw.
+ULT_STATE_PRIV_DIM = 9
+ULT_PRIVILEGE_DIM = ULT_DOMAIN_PRIV_DIM + ULT_STATE_PRIV_DIM + len(ULT_HEIGHTMAP_X) * len(ULT_HEIGHTMAP_Y)
 
 
 def policy_name(env_cfg):
@@ -101,6 +135,11 @@ def canonicalize_policy_env_cfg(env_cfg):
 def is_dreamwaq_policy(env_cfg):
     """Return whether the env config selects the DreamWaQ actor and context estimator."""
     return policy_name(env_cfg) == POLICY_DREAMWAQ
+
+
+def is_ult_policy(env_cfg):
+    """Return whether the env config selects the ULT transformer policy."""
+    return policy_name(env_cfg) == POLICY_ULT
 
 
 def locomotion_cfgs():
@@ -200,6 +239,14 @@ def curriculum_reward_scales():
     }
 
 
+def ult_obs_groups():
+    """Return the actor and critic observation groups for the ULT policy."""
+    return {
+        "actor": ["proprio_history", "action_history", "privilege"],
+        "critic": ["proprio_flat", "privilege"],
+    }
+
+
 def dreamwaq_obs_groups():
     """Return the actor and critic observation groups for the DreamWaQ policy.
 
@@ -215,10 +262,12 @@ def dreamwaq_obs_groups():
 def policy_obs_groups(env_cfg):
     """Return the actor and critic groups saved with a walking config.
 
-    The flat MLP walker keeps the single proprioceptive group. The DreamWaQ policy selects ``dreamwaq_obs_groups``.
+    The flat MLP walker keeps the single proprioceptive group. DreamWaQ and ULT select their dedicated groups.
     """
     if is_dreamwaq_policy(env_cfg):
         return dreamwaq_obs_groups()
+    if is_ult_policy(env_cfg):
+        return ult_obs_groups()
     return {"actor": ["policy"], "critic": ["policy"]}
 
 
@@ -283,6 +332,55 @@ def apply_curriculum(env_cfg, reward_cfg, command_cfg=None):
         command_cfg["lin_vel_x_range"] = [-1.0, SPEED_VX_CAPS[0]]
         command_cfg["lin_vel_y_range"] = [-0.5, 0.5]
         command_cfg["ang_vel_range"] = [-1.0, 1.0]
+
+
+def apply_ult(env_cfg, reward_cfg, command_cfg):
+    """Point a curriculum walking config at the simulation setup of the ULT paper, and select the ULT policy.
+
+    Call it after ``apply_curriculum``. The PD gains, the commands, the domain randomization and the rewards follow
+    the paper. Terrain kinds are drawn with the paper proportions, the stairs column holding the shares of stairs up
+    and stairs down, and every column moves one level per episode across the 0.8 and 0.25 tracking fractions.
+    """
+    env_cfg["policy"] = POLICY_ULT
+    env_cfg["kp"] = 30.0
+    env_cfg["kd"] = 0.7
+    env_cfg["resampling_time_s"] = 10.0
+    env_cfg["speed_curriculum"] = False
+    env_cfg["terrain_kind_fractions"] = (0.1, 0.1, 0.2, 0.6)
+    env_cfg["terrain_promote_episodes"] = 1
+    env_cfg["randomization"] = {
+        "friction": (0.7, 1.3),
+        "mass_scale": (1.0, 1.0),
+        "com_offset": 0.0,
+        "inertia_scale": (1.0, 1.0),
+        "gain_scale": (0.9, 1.1),
+        "force_scale": (0.9, 1.1),
+        "gravity_scale": (9.41 / 9.81, 10.21 / 9.81),
+        "push_xy": 0.0,
+        "push_z": 0.0,
+        "payload": (0.0, 5.0),
+        "system_delay": (0.0, 0.015),
+        "friction_coefficient": None,
+        "kd_scale": (0.9, 1.1),
+        "payload_com_offset": 0.1,
+        "push_vel_xy": 1.0,
+    }
+    reward_cfg["tracking_sigma"] = 0.2
+    reward_cfg["reward_scales"] = {
+        "tracking_lin_vel": 1.0,
+        "tracking_ang_vel": 0.5,
+        "lin_vel_z": -2.0,
+        "ang_vel_xy": -0.05,
+        "dof_acc": -2.5e-7,
+        "joint_power": -2.0e-5,
+        "action_rate": -0.05,
+        "feet_slip": -0.1,
+        "collision": -1.0,
+    }
+    command_cfg["lin_vel_x_range"] = [-0.5, 0.5]
+    command_cfg["lin_vel_y_range"] = [-0.5, 0.5]
+    command_cfg["ang_vel_range"] = [-0.5, 0.5]
+    command_cfg["heading_range"] = [-math.pi, math.pi]
 
 
 def build_curriculum_height_field(
@@ -370,6 +468,10 @@ class Go2Env:
     def is_dreamwaq_policy(self):
         return self._policy == POLICY_DREAMWAQ
 
+    @property
+    def is_ult_policy(self):
+        return self._policy == POLICY_ULT
+
     def __init__(self, num_envs, env_cfg, obs_cfg, reward_cfg, command_cfg, show_viewer=False):
         self.num_envs: int = num_envs
         self._batch_n = num_envs if num_envs > 0 else 1
@@ -387,9 +489,10 @@ class Go2Env:
         self.reward_cfg = reward_cfg
         self.command_cfg = command_cfg
         self._policy = canonicalize_policy_env_cfg(self.env_cfg)
-        if self._policy not in (POLICY_MLP, POLICY_DREAMWAQ):
+        if self._policy not in (POLICY_MLP, POLICY_DREAMWAQ, POLICY_ULT):
             raise gs.GenesisException(
-                f"Unknown policy '{self._policy}'. Supported policies: '{POLICY_MLP}' and '{POLICY_DREAMWAQ}'."
+                f"Unknown policy '{self._policy}'. Supported policies: '{POLICY_MLP}', '{POLICY_DREAMWAQ}', "
+                f"and '{POLICY_ULT}'."
             )
 
         self.obs_scales: dict[str, float] = obs_cfg["obs_scales"]
@@ -477,13 +580,15 @@ class Go2Env:
 
         # The foot is a fixed child of the calf, so the loader folds it into the calf. Clearance and foot contact
         # read that sphere as its own link, which means naming it here. The flat-ground rewards never read it.
-        needs_feet = "feet_clearance" in self.reward_scales
+        self._has_feet = (
+            "feet_clearance" in self.reward_scales or "feet_slip" in self.reward_scales or self.is_ult_policy
+        )
         self.robot = self.scene.add_entity(
             gs.morphs.URDF(
                 file="urdf/go2/urdf/go2.urdf",
                 pos=self.env_cfg["base_init_pos"],
                 quat=self.env_cfg["base_init_quat"],
-                links_to_keep=FOOT_LINK_NAMES if needs_feet else (),
+                links_to_keep=FOOT_LINK_NAMES if self._has_feet else (),
             ),
         )
 
@@ -496,7 +601,8 @@ class Go2Env:
             device=gs.device,
         )
         self.actions_dof_idx = torch.argsort(self.motors_dof_idx)
-        self._feet_idx = [self.robot.get_link(name).idx_local for name in FOOT_LINK_NAMES] if needs_feet else []
+        self._feet_idx = [self.robot.get_link(name).idx_local for name in FOOT_LINK_NAMES] if self._has_feet else []
+        self._collision_links_idx = [self.robot.get_link(name).idx_local for name in COLLISION_LINK_NAMES]
         self._base_link = self.robot.get_link("base")
 
         # PD control parameters
@@ -588,7 +694,10 @@ class Go2Env:
             device=gs.device,
         )
         self.extras = dict()  # extra information for logging
-        kind_weights = torch.tensor(TERRAIN_KIND_FRACTIONS, dtype=gs.tc_float, device=gs.device)
+        kind_weights = torch.tensor(
+            env_cfg.get("terrain_kind_fractions", TERRAIN_KIND_FRACTIONS), dtype=gs.tc_float, device=gs.device
+        )
+        self._promote_episodes = env_cfg.get("terrain_promote_episodes", SLOW_PROMOTE_EPISODES)
         self.terrain_types = torch.multinomial(kind_weights, self._batch_n, replacement=True)
         # Smooth slopes weight a row by the square of its index, so the steep rows take most of that column. The other
         # columns keep a linear ramp on the row index. Both mixes keep a flat-row share.
@@ -627,8 +736,35 @@ class Go2Env:
                 (self._batch_n, HISTORY_STEPS, self._proprio_dim), dtype=gs.tc_float, device=gs.device
             )
             self._episode_return = torch.zeros((self._batch_n,), dtype=gs.tc_float, device=gs.device)
+        self._ult_proprio_history = None
+        self._ult_action_history = None
+        self._ult_proprio_step = None
+        self._ult_privilege = None
+        self._domain_privilege = None
+        self._heightmap_offsets = None
+        if self.is_ult_policy:
+            self._ult_proprio_history = torch.zeros(
+                (self._batch_n, ULT_HISTORY_STEPS, ULT_PROPRIO_DIM), dtype=gs.tc_float, device=gs.device
+            )
+            self._ult_action_history = torch.zeros(
+                (self._batch_n, ULT_HISTORY_STEPS, self.num_actions), dtype=gs.tc_float, device=gs.device
+            )
+            self._domain_privilege = torch.zeros(
+                (self._batch_n, ULT_DOMAIN_PRIV_DIM), dtype=gs.tc_float, device=gs.device
+            )
+            grid_x, grid_y = torch.meshgrid(
+                torch.tensor(ULT_HEIGHTMAP_X, dtype=gs.tc_float, device=gs.device),
+                torch.tensor(ULT_HEIGHTMAP_Y, dtype=gs.tc_float, device=gs.device),
+                indexing="ij",
+            )
+            self._heightmap_offsets = torch.stack((grid_x, grid_y), dim=-1).reshape(-1, 2)
+        self._heading = None
+        if "heading_range" in command_cfg:
+            self._heading = torch.zeros((self._batch_n,), dtype=gs.tc_float, device=gs.device)
         self._feet_pos = None
         self._feet_vel = None
+        self._feet_contact = torch.zeros((self._batch_n, len(FOOT_LINK_NAMES)), dtype=torch.bool, device=gs.device)
+        self._collision_count = None
         self._dof_acc = None
         self._motor_torque = None
         self._motor_power = None
@@ -647,6 +783,8 @@ class Go2Env:
             "action_smoothness": self._reward_action_smoothness,
             "power_distribution": self._reward_power_distribution,
             "similar_to_default": self._reward_similar_to_default,
+            "feet_slip": self._reward_feet_slip,
+            "collision": self._reward_collision,
         }
         # The flat walker folds the control period into each weight. Curriculum weights are the per-step multipliers.
         scale_by_dt = self._terrain_kind != "curriculum"
@@ -755,7 +893,7 @@ class Go2Env:
         slope_delta = is_up.to(dtype=gs.tc_int) - is_down.to(dtype=gs.tc_int)
         streak = torch.where(finished & is_slow & is_up, self._promote_streak + 1, self._promote_streak)
         streak = torch.where(finished & is_slow & ~is_up, torch.zeros_like(streak), streak)
-        is_slow_promote = finished & is_slow & (streak >= SLOW_PROMOTE_EPISODES)
+        is_slow_promote = finished & is_slow & (streak >= self._promote_episodes)
         streak = torch.where(is_slow_promote, torch.zeros_like(streak), streak)
         slow_delta = is_slow_promote.to(dtype=gs.tc_int) - (finished & is_slow & is_down).to(dtype=gs.tc_int)
         delta = torch.where(is_slow, slow_delta, torch.where(finished, slope_delta, torch.zeros_like(slope_delta)))
@@ -812,11 +950,18 @@ class Go2Env:
             ) * ranges.com_offset
             inertia_scale = self._sample_interval(*ranges.inertia_scale, (count, n_links, 1, 1))
             gravity_scale = self._sample_interval(*ranges.gravity_scale, (count, 1))
+        payload_com = torch.zeros((*link_shape[:-1], 3), dtype=gs.tc_float, device=gs.device)
+        if ranges.payload_com_offset > 0.0:
+            payload_com = self._sample_interval(
+                -ranges.payload_com_offset, ranges.payload_com_offset, payload_com.shape
+            )
+        com_offset[..., base_local, :] += payload_com
         self.robot.set_links_COM(self._nominal_com + com_offset, envs_idx=env_ids)
         self.robot.set_links_inertia(self._nominal_inertia * inertia_scale, envs_idx=env_ids)
         gain_scale = self._sample_interval(*ranges.gain_scale, dof_shape)
+        kd_scale = gain_scale if ranges.kd_scale is None else self._sample_interval(*ranges.kd_scale, dof_shape)
         self.robot.set_dofs_kp(self.env_cfg["kp"] * gain_scale, self.motors_dof_idx, env_ids)
-        self.robot.set_dofs_kv(self.env_cfg["kd"] * gain_scale, self.motors_dof_idx, env_ids)
+        self.robot.set_dofs_kv(self.env_cfg["kd"] * kd_scale, self.motors_dof_idx, env_ids)
         force_scale = self._sample_interval(*ranges.force_scale, dof_shape)
         self.robot.set_dofs_force_range(
             self._nominal_force_lower * force_scale,
@@ -838,12 +983,92 @@ class Go2Env:
             self._action_delay.copy_(delay)
         else:
             self._action_delay[env_ids] = delay
+        if not self.is_ult_policy:
+            return
+        domain = torch.cat(
+            (
+                gain_scale.reshape(count, -1),
+                kd_scale.reshape(count, -1),
+                force_scale.reshape(count, -1),
+                friction[..., self._feet_idx].reshape(count, -1),
+                payload.reshape(count, 1),
+                payload_com.reshape(count, 3),
+                gravity_scale.reshape(count, 1),
+                delay.reshape(count, 1),
+            ),
+            dim=-1,
+        )
+        if env_ids is None:
+            self._domain_privilege.copy_(domain)
+        else:
+            self._domain_privilege[env_ids] = domain
+
+    def _apply_velocity_push(self):
+        """Add a random horizontal velocity to the base of each episode reaching a push interval."""
+        push_interval = int(self._randomization.push_interval_s / self.dt)
+        is_pushed = (self.episode_length_buf % push_interval == 0) & (self.episode_length_buf > 0)
+        if not bool(is_pushed.any()):
+            return
+        envs_idx = is_pushed.nonzero(as_tuple=True)[0] if self.num_envs > 0 else None
+        push_vel_xy = self._randomization.push_vel_xy
+        base_vel = self._batch(self.robot.get_dofs_velocity(dofs_idx_local=(0, 1), envs_idx=envs_idx))
+        base_vel += self._sample_interval(-push_vel_xy, push_vel_xy, base_vel.shape)
+        self.robot.set_dofs_velocity(
+            base_vel if self.num_envs > 0 else base_vel[0], dofs_idx_local=(0, 1), envs_idx=envs_idx
+        )
+
+    def _heading_yaw_rate(self):
+        """Return the yaw rate command that turns the base toward its heading command, clipped to the yaw range."""
+        yaw = quat_to_xyz(self.base_quat, rpy=True)[:, 2]
+        heading_error = torch.remainder(self._heading - yaw + math.pi, 2.0 * math.pi) - math.pi
+        return torch.clip(HEADING_GAIN * heading_error, *self.command_cfg["ang_vel_range"])
+
+    def _local_heightmap(self):
+        """Return the terrain height minus the base height at the height map points, which turn with the base yaw."""
+        yaw = quat_to_xyz(self.base_quat, rpy=True)[:, 2:]
+        cos_yaw, sin_yaw = torch.cos(yaw), torch.sin(yaw)
+        offset_x, offset_y = self._heightmap_offsets[:, 0], self._heightmap_offsets[:, 1]
+        points_xy = torch.stack(
+            (
+                self.base_pos[:, :1] + cos_yaw * offset_x - sin_yaw * offset_y,
+                self.base_pos[:, 1:2] + sin_yaw * offset_x + cos_yaw * offset_y,
+            ),
+            dim=-1,
+        )
+        return self._terrain_z(points_xy) - self.base_pos[:, 2:]
+
+    def _compose_ult_privilege(self):
+        state = torch.cat(
+            (
+                self.base_lin_vel * self.obs_scales["lin_vel"],
+                self.base_ang_vel * self.obs_scales["ang_vel"],
+                quat_to_xyz(self.base_quat, rpy=True),
+            ),
+            dim=-1,
+        )
+        return torch.cat((self._domain_privilege, state, self._local_heightmap()), dim=-1)
+
+    def _build_ult_proprio_step(self):
+        return torch.cat(
+            (
+                (self.dof_pos - self.default_dof_pos) * self.obs_scales["dof_pos"],
+                self.dof_vel * self.obs_scales["dof_vel"],
+                self.base_ang_vel * self.obs_scales["ang_vel"],
+                self.projected_gravity,
+                # A reset base spawns above the ground, so its feet start out of contact.
+                torch.where(self._feet_contact & (self.reset_buf[:, None] == 0), 1.0, 0.0),
+                self.commands * self.commands_scale,
+            ),
+            dim=-1,
+        )
 
     def _apply_push(self):
         if not self._has_domain_randomization:
             return
         force = self._push_force if self.num_envs > 0 else self._push_force[0]
         self._base_link.apply_external_wrench(force=force)
+        if self._randomization.push_vel_xy > 0.0:
+            self._apply_velocity_push()
 
     def _spawn_qpos(self):
         if self.terrain is None:
@@ -884,12 +1109,24 @@ class Go2Env:
             self.commands.copy_(commands)
         else:
             torch.where(envs_idx[:, None], commands, self.commands, out=self.commands)
+        if self._heading is None:
+            return
+        heading = self._sample_interval(*self.command_cfg["heading_range"], (self._batch_n,))
+        if envs_idx is None:
+            self._heading.copy_(heading)
+        else:
+            torch.where(envs_idx, heading, self._heading, out=self._heading)
+        self.commands[:, 2] = self._heading_yaw_rate()
 
     def _read_feet_and_motors(self):
-        needs_feet = "feet_clearance" in self.reward_functions
-        if needs_feet:
+        if self._has_feet:
             self._feet_pos = self._batch(self.robot.get_links_pos(self._feet_idx))
             self._feet_vel = self._batch(self.robot.get_links_vel(self._feet_idx))
+        if self.is_ult_policy or "feet_slip" in self.reward_functions or "collision" in self.reward_functions:
+            links_force_norm = torch.linalg.norm(self._batch(self.robot.get_links_net_contact_force()), dim=-1)
+            self._feet_contact = links_force_norm[:, self._feet_idx] > CONTACT_FORCE_THRESHOLD
+            is_colliding = links_force_norm[:, self._collision_links_idx] > CONTACT_FORCE_THRESHOLD
+            self._collision_count = is_colliding.sum(dim=-1)
         if "dof_acc" in self.reward_functions:
             self._dof_acc = self._batch(self.robot.get_dofs_acc(self.motors_dof_idx))
         if "joint_power" in self.reward_functions or "power_distribution" in self.reward_functions:
@@ -923,6 +1160,8 @@ class Go2Env:
         self.dof_pos = self._batch(self.robot.get_dofs_position(self.motors_dof_idx))
         self.dof_vel = self._batch(self.robot.get_dofs_velocity(self.motors_dof_idx))
         self._read_feet_and_motors()
+        if self._heading is not None:
+            self.commands[:, 2] = self._heading_yaw_rate()
         if self.terrain is not None:
             self.episode_tracking_lin += self._reward_tracking_lin_vel()
 
@@ -969,6 +1208,17 @@ class Go2Env:
         return self.get_observations(), self.rew_buf, self.reset_buf, self.extras
 
     def get_observations(self):
+        if self.is_ult_policy:
+            self._published_observations = TensorDict(
+                {
+                    "proprio_history": self._ult_proprio_history,
+                    "action_history": self._ult_action_history,
+                    "privilege": self._ult_privilege,
+                    "proprio_flat": self._ult_proprio_step,
+                },
+                batch_size=[self._batch_n],
+            )
+            return self._published_observations
         if not self.is_dreamwaq_policy:
             self._published_observations = TensorDict({"policy": self.obs_buf}, batch_size=[self._batch_n])
             return self._published_observations
@@ -1145,6 +1395,21 @@ class Go2Env:
             ),
             dim=-1,
         )
+        if self.is_ult_policy:
+            proprio = self._build_ult_proprio_step()
+            rolled_proprio = torch.roll(self._ult_proprio_history, shifts=-1, dims=1)
+            rolled_action = torch.roll(self._ult_action_history, shifts=-1, dims=1)
+            rolled_proprio[:, -1] = proprio
+            rolled_action[:, -1] = self.actions
+            filled_proprio = proprio[:, None, :].expand_as(self._ult_proprio_history)
+            filled_action = self.actions[:, None, :].expand_as(self._ult_action_history)
+            # Filling the whole window drops the previous episode, as for the DreamWaQ history below.
+            is_resetting = self.reset_buf[:, None, None] != 0
+            self._ult_proprio_history = torch.where(is_resetting, filled_proprio, rolled_proprio)
+            self._ult_action_history = torch.where(is_resetting, filled_action, rolled_action)
+            self._ult_proprio_step = proprio
+            self._ult_privilege = self._compose_ult_privilege()
+            return
         if not self.is_dreamwaq_policy:
             return
         assert self.obs_buf.shape[-1] == self._proprio_dim
@@ -1217,6 +1482,15 @@ class Go2Env:
         clearance = self._feet_pos[..., 2] - self._terrain_z(self._feet_pos[..., :2])
         speed = torch.linalg.norm(self._feet_vel[..., :2], dim=-1)
         return torch.sum(torch.square(clearance - self.reward_cfg["feet_height_target"]) * speed, dim=1)
+
+    def _reward_feet_slip(self):
+        # Penalize the horizontal speed of the feet in contact with the ground
+        speed = torch.linalg.norm(self._feet_vel[..., :2], dim=-1)
+        return torch.sum(torch.where(self._feet_contact, speed, 0.0), dim=1)
+
+    def _reward_collision(self):
+        # Penalize the number of thigh and calf links touching the ground
+        return self._collision_count
 
     def _reward_power_distribution(self):
         # Penalize the square of the variance of signed joint power across the motors

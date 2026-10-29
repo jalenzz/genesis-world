@@ -52,6 +52,8 @@ def _load_cfgs(exp_name):
 def _make_env(exp_name, num_envs, show_viewer, terrain, terrain_level=None, pin_easiest=False, rendered_envs_idx=None):
     env_cfg, obs_cfg, reward_cfg, command_cfg, train_cfg = _load_cfgs(exp_name)
     reward_cfg["reward_scales"] = {}
+    # A heading command rewrites the yaw rate every step, which would override the yaw rate pinned here.
+    command_cfg.pop("heading_range", None)
     if terrain == "curriculum":
         env_cfg["terrain"] = "curriculum"
         # A height field overflows the flat budget of 20 and the overflow reset leaves the robot standing still.
