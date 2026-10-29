@@ -968,6 +968,9 @@ class Go2Env:
             if self._speed_level is not None and name == "tracking_lin_vel":
                 self._speed_track_sum += rew.sum()
                 self._speed_track_count += rew.numel()
+        # The episode sums keep the raw step. The learner reward is bounded so one diverging environment cannot set
+        # the return scale.
+        self.rew_buf.clamp_(min=-5.0, max=5.0)
         if self.is_dreamwaq_policy:
             self._episode_return += self.rew_buf
 
