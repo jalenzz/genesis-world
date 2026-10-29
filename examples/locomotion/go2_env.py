@@ -217,7 +217,7 @@ def curriculum_reward_scales():
 def ult_obs_groups():
     """Return the actor and critic observation groups for the ULT policy."""
     return {
-        "actor": ["proprio_history", "action_history", "privilege", "nsa_target"],
+        "actor": ["proprio_history", "action_history", "privilege"],
         "critic": ["proprio_flat", "privilege"],
     }
 
@@ -658,7 +658,6 @@ class Go2Env:
         self._ult_action_history = None
         self._ult_proprio_step = None
         self._ult_privilege = None
-        self._ult_nsa_target = None
         self._domain_privilege = torch.zeros(
             (self.batch_size, ULT_DOMAIN_PRIV_DIM), dtype=gs.tc_float, device=gs.device
         )
@@ -673,7 +672,6 @@ class Go2Env:
                 (self.batch_size, ULT_PROPRIO_DIM), dtype=gs.tc_float, device=gs.device
             )
             self._ult_privilege = torch.zeros((self.batch_size, ULT_PRIVILEGE_DIM), dtype=gs.tc_float, device=gs.device)
-            self._ult_nsa_target = torch.zeros((self.batch_size, ULT_TOKEN_DIM), dtype=gs.tc_float, device=gs.device)
         self._feet_pos = None
         self._feet_vel = None
         self._dof_acc = None
@@ -1168,7 +1166,6 @@ class Go2Env:
                     "proprio_history": self._ult_proprio_history,
                     "action_history": self._ult_action_history,
                     "privilege": self._ult_privilege,
-                    "nsa_target": self._ult_nsa_target,
                     "proprio_flat": self._ult_proprio_step,
                 },
                 batch_size=[self.batch_size],
@@ -1367,14 +1364,13 @@ class Go2Env:
     def _update_observation(self):
         self.obs_buf = self._proprioception()
         if self.is_ult_policy:
-            self._ult_nsa_target = torch.cat((self._ult_proprio_step, self.last_actions), dim=-1)
             proprio = self._build_ult_proprio_step()
             rolled_proprio = torch.roll(self._ult_proprio_history, shifts=-1, dims=1)
             rolled_action = torch.roll(self._ult_action_history, shifts=-1, dims=1)
             rolled_proprio[:, -1] = proprio
-            rolled_action[:, -1] = self.last_actions
+            rolled_action[:, -1] = self.actions
             filled_proprio = proprio[:, None, :].expand_as(self._ult_proprio_history)
-            filled_action = self.last_actions[:, None, :].expand_as(self._ult_action_history)
+            filled_action = self.actions[:, None, :].expand_as(self._ult_action_history)
             is_resetting = self.reset_buf[:, None, None] != 0
             updated_proprio = torch.where(is_resetting, filled_proprio, rolled_proprio)
             updated_action = torch.where(is_resetting, filled_action, rolled_action)
