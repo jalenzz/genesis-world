@@ -30,8 +30,7 @@ from genesis.utils.misc import tensor_to_array
 from genesis.vis.keybindings import Key, KeyAction, Keybind
 
 from dreamwaq import DreamWaQRunner
-from go2_env import TERRAIN_KINDS, Go2Env, is_dreamwaq_policy, is_ult_policy
-from ult import ULTRunner
+from go2_env import TERRAIN_KINDS, Go2Env, is_dreamwaq_policy
 
 # Resting Xbox sticks sit a little off center. Inside this band the command is 0.
 STICK_DEADZONE = 0.15
@@ -53,6 +52,8 @@ def _load_cfgs(exp_name):
 def _make_env(exp_name, num_envs, show_viewer, terrain, terrain_level=None, pin_easiest=False, rendered_envs_idx=None):
     env_cfg, obs_cfg, reward_cfg, command_cfg, train_cfg = _load_cfgs(exp_name)
     reward_cfg["reward_scales"] = {}
+    # A heading command rewrites the yaw rate every step, which would override the yaw rate pinned here.
+    command_cfg.pop("heading_range", None)
     if terrain == "curriculum":
         env_cfg["terrain"] = "curriculum"
         # A height field overflows the flat budget of 20 and the overflow reset leaves the robot standing still.
@@ -182,12 +183,7 @@ def run_metrics(args):
     env.env_cfg["termination_if_pitch_greater_than"] = 180.0
 
     log_dir = f"logs/{args.exp_name}"
-    if is_dreamwaq_policy(env_cfg):
-        runner_cls = DreamWaQRunner
-    elif is_ult_policy(env_cfg):
-        runner_cls = ULTRunner
-    else:
-        runner_cls = OnPolicyRunner
+    runner_cls = DreamWaQRunner if is_dreamwaq_policy(env_cfg) else OnPolicyRunner
     runner = runner_cls(env, train_cfg, log_dir, device=gs.device)
     ckpt_path = os.path.join(log_dir, f"model_{args.ckpt}.pt")
     runner.load(ckpt_path)
@@ -447,12 +443,7 @@ def run_teleop(args):
 
     env.scene.viewer.update = update_and_chase
 
-    if is_dreamwaq_policy(env_cfg):
-        runner_cls = DreamWaQRunner
-    elif is_ult_policy(env_cfg):
-        runner_cls = ULTRunner
-    else:
-        runner_cls = OnPolicyRunner
+    runner_cls = DreamWaQRunner if is_dreamwaq_policy(env_cfg) else OnPolicyRunner
     runner = runner_cls(env, train_cfg, log_dir, device=gs.device)
     runner.load(ckpt_path)
     policy = runner.get_inference_policy(device=gs.device)

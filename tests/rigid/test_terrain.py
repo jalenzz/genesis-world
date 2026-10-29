@@ -902,70 +902,91 @@ def test_saved_estimator_key_maps_to_dreamwaq_policy():
     assert "estimator" not in env_cfg_copy
 
 
-def test_ult_policy_rollout_and_update():
+@pytest.mark.precision("32")
+@pytest.mark.parametrize("n_envs", [0, 2])
+def test_ult_policy(n_envs, show_viewer):
     pytest.importorskip("rsl_rl")
     go2_train = importlib.import_module("go2_train")
-    tensordict = importlib.import_module("tensordict")
     ult = importlib.import_module("ult")
 
-    env_cfg, _, reward_cfg, command_cfg = go2_locomotion_env.locomotion_cfgs()
+    env_cfg, obs_cfg, reward_cfg, command_cfg = go2_locomotion_env.locomotion_cfgs()
     go2_locomotion_env.apply_curriculum(env_cfg, reward_cfg, command_cfg)
-    env_cfg["policy"] = go2_locomotion_env.POLICY_ULT
-    assert not go2_locomotion_env.is_dreamwaq_policy(env_cfg)
-    groups = go2_locomotion_env.policy_obs_groups(env_cfg)
-    assert groups["critic"] == ["proprio_flat", "privilege"]
-
+    go2_locomotion_env.apply_ult(env_cfg, reward_cfg, command_cfg)
+    env_cfg["terrain_subterrain_size"] = (4.0, 4.0)
+    env_cfg["terrain_horizontal_scale"] = 0.5
+    env_cfg["terrain_vertical_scale"] = 0.01
+    env_cfg["terrain_kind_fractions"] = (1.0, 0.0, 0.0, 0.0)
+    env_cfg["initial_terrain_level"] = 0
+    env = go2_locomotion_env.Go2Env(
+        num_envs=n_envs,
+        env_cfg=env_cfg,
+        obs_cfg=obs_cfg,
+        reward_cfg=reward_cfg,
+        command_cfg=command_cfg,
+        show_viewer=show_viewer,
+    )
+    batch_n = env._batch_n
     history_steps = go2_locomotion_env.ULT_HISTORY_STEPS
-    mask = ult.ult_causal_attention_mask(history_steps, torch.device("cpu"))
+
+    mask = ult.ult_causal_attention_mask(history_steps, gs.device)
     assert mask[:history_steps, history_steps].all()
     assert_equal(mask[:history_steps, :history_steps], torch.ones((history_steps, history_steps)).triu(1).bool())
     assert not mask[history_steps].any()
 
-    torch.manual_seed(0)
-    n_envs, n_steps = 4, 3
-    train_cfg = go2_train.configure_ult_train_cfg("go2-ult-test", env_cfg)
-    train_cfg["num_steps_per_env"] = n_steps
-    train_cfg["multi_gpu"] = None
-
-    obs_seq = [
-        tensordict.TensorDict(
-            {
-                "proprio_history": torch.randn((n_envs, history_steps, go2_locomotion_env.ULT_PROPRIO_DIM)),
-                "action_history": torch.randn((n_envs, history_steps, 12)),
-                "privilege": torch.randn((n_envs, go2_locomotion_env.ULT_PRIVILEGE_DIM)),
-                "proprio_flat": torch.randn((n_envs, go2_locomotion_env.ULT_PROPRIO_DIM)),
-            },
-            batch_size=[n_envs],
-        )
-        for _ in range(n_steps + 1)
+    obs = env.reset()
+    assert obs["privilege"].shape == (batch_n, go2_locomotion_env.ULT_PRIVILEGE_DIM)
+    assert_equal(obs["proprio_history"], obs["proprio_history"][:, -1:].expand_as(obs["proprio_history"]))
+    assert_equal(obs["action_history"], torch.zeros_like(obs["action_history"]))
+    # Table I ranges of the gains, motor strength, foot friction, payload, payload center of mass, gravity and delay.
+    domain = obs["privilege"][:, : go2_locomotion_env.ULT_DOMAIN_PRIV_DIM]
+    assert ((domain[:, :36] >= 0.9) & (domain[:, :36] <= 1.1)).all()
+    assert ((domain[:, 36:40] >= 0.7) & (domain[:, 36:40] <= 1.3)).all()
+    assert ((domain[:, 40] >= 0.0) & (domain[:, 40] <= 5.0)).all()
+    assert (domain[:, 41:44].abs() <= 0.1).all()
+    assert ((domain[:, 44] >= 9.41 / 9.81) & (domain[:, 44] <= 10.21 / 9.81)).all()
+    assert ((domain[:, 45] >= 0.0) & (domain[:, 45] <= 0.015)).all()
+    heightmap = obs["privilege"][
+        :, -len(go2_locomotion_env.ULT_HEIGHTMAP_X) * len(go2_locomotion_env.ULT_HEIGHTMAP_Y) :
     ]
-    env = SimpleNamespace(num_envs=n_envs, num_actions=12)
-    alg = ult.ULTPPO.construct_algorithm(obs_seq[0], env, train_cfg, "cpu")
-    dones = torch.tensor([False, True, False, False])
+    assert_allclose(heightmap, -env_cfg["base_init_pos"][2], tol=1e-3)
+
+    zero_actions = torch.zeros((batch_n, env.num_actions), dtype=gs.tc_float, device=gs.device)
+    for _ in range(25):
+        obs, *_ = env.step(zero_actions)
+    assert_equal(obs["proprio_history"][:, -1, 30:34], torch.ones((batch_n, 4)))
+    prev_obs = obs.clone()
+    obs, *_ = env.step(torch.full_like(zero_actions, 0.1))
+    assert_equal(obs["proprio_history"][:, :-1], prev_obs["proprio_history"][:, 1:])
+    assert_equal(obs["action_history"][:, :-1], prev_obs["action_history"][:, 1:])
+    assert_allclose(obs["action_history"][:, -1], 0.1, tol=gs.EPS)
+
+    train_cfg = go2_train.configure_ult_train_cfg("go2-ult-test", env_cfg, batch_n, max_iterations=10)
+    train_cfg["num_steps_per_env"] = 4
+    train_cfg["multi_gpu"] = None
+    vec_env = SimpleNamespace(num_envs=batch_n, num_actions=env.num_actions)
+    alg = ult.ULTPPO.construct_algorithm(obs, vec_env, train_cfg, gs.device)
+    learning_rate = alg.learning_rate
     with torch.inference_mode():
-        for i_step in range(n_steps):
-            alg.act(obs_seq[i_step])
-            alg.process_env_step(obs_seq[i_step + 1], torch.zeros(n_envs), dones, {})
+        for _ in range(train_cfg["num_steps_per_env"]):
+            actions = alg.act(obs)
+            obs, rewards, dones, extras = env.step(actions)
+            alg.process_env_step(obs, rewards, dones, extras)
+        alg.compute_returns(obs)
 
     storage = alg.storage
     with torch.no_grad():
-        for i_step in range(n_steps):
+        for i_step in range(train_cfg["num_steps_per_env"]):
             step_obs = storage.observations[i_step]
-            student_out, teacher_out, _ = alg.actor.forward_heads(step_obs)
-            is_teacher = step_obs["ult_is_teacher"]
-            alg.actor.distribution.update(torch.where(is_teacher, teacher_out, student_out))
+            _, student_action, teacher_action = alg.actor.forward_heads(step_obs)
+            alg.actor.distribution.update(
+                torch.where(step_obs[ult.EXECUTED_TEACHER_KEY], teacher_action, student_action)
+            )
             log_prob = alg.actor.get_output_log_prob(storage.actions[i_step])
             assert_allclose(log_prob, storage.actions_log_prob[i_step, :, 0], tol=1e-5)
-
-            next_obs = obs_seq[i_step + 1]
-            nsa_target = torch.cat((next_obs["proprio_history"][:, -1], next_obs["action_history"][:, -1]), dim=-1)
-            assert_allclose(step_obs["ult_nsa_target"], nsa_target, tol=0.0)
-            assert_equal(step_obs["ult_is_nsa_valid"][:, 0], ~dones)
-
-            student_obs = step_obs.exclude("privilege")
-            assert_allclose(alg.actor(student_obs), alg.actor.distribution.deterministic_output(student_out), tol=1e-5)
+            assert_allclose(alg.actor(step_obs.exclude("privilege")), student_action, tol=1e-5)
 
     losses = alg.update()
     assert all(math.isfinite(value) for value in losses.values())
-    assert losses["ult_nsa"] > 0.0
+    assert losses["ult_next_state_action"] > 0.0
     assert losses["ult_imitation"] > 0.0
+    assert_allclose(alg.learning_rate, learning_rate * 0.5 * (1.0 + math.cos(math.pi / 10)), tol=1e-9)
