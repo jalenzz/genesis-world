@@ -872,30 +872,70 @@ def test_saved_estimator_key_maps_to_dreamwaq_policy():
     assert "estimator" not in env_cfg_copy
 
 
-def test_ult_policy_obs_groups_and_privilege_mask():
-    _ULT_PATH = _LOCOMOTION_DIR / "ult.py"
-    _ult_spec = importlib.util.spec_from_file_location("go2_locomotion_ult", _ULT_PATH)
-    go2_locomotion_ult = importlib.util.module_from_spec(_ult_spec)
-    _ult_spec.loader.exec_module(go2_locomotion_ult)
+def test_ult_policy_rollout_and_update():
+    pytest.importorskip("rsl_rl")
+    go2_train = importlib.import_module("go2_train")
+    tensordict = importlib.import_module("tensordict")
+    ult = importlib.import_module("ult")
 
     env_cfg, _, reward_cfg, command_cfg = go2_locomotion_env.locomotion_cfgs()
     go2_locomotion_env.apply_curriculum(env_cfg, reward_cfg, command_cfg)
-    assert env_cfg.get("policy") is None
-    assert env_cfg.get("estimator") is None
     env_cfg["policy"] = go2_locomotion_env.POLICY_ULT
     assert not go2_locomotion_env.is_dreamwaq_policy(env_cfg)
     groups = go2_locomotion_env.policy_obs_groups(env_cfg)
-    assert groups["actor"] == ["proprio_history", "action_history", "privilege", "nsa_target"]
     assert groups["critic"] == ["proprio_flat", "privilege"]
-    assert go2_locomotion_env.ULT_PROPRIO_DIM == 37
-    assert go2_locomotion_env.ULT_HISTORY_STEPS == 15
-    assert go2_locomotion_env.ULT_PRIVILEGE_DIM == go2_locomotion_env.ULT_DOMAIN_PRIV_DIM + go2_locomotion_env.ULT_STATE_PRIV_DIM + go2_locomotion_env.ULT_HEIGHTMAP_SIDE ** 2
 
     history_steps = go2_locomotion_env.ULT_HISTORY_STEPS
-    priv_idx = history_steps
-    mask = go2_locomotion_ult.ult_causal_attention_mask(history_steps, torch.device("cpu"))
-    assert mask[0, priv_idx]
-    assert mask[history_steps - 1, priv_idx]
-    assert not mask[0, 0]
-    assert mask[0, 1]
-    assert not mask[priv_idx, 0]
+    mask = ult.ult_causal_attention_mask(history_steps, torch.device("cpu"))
+    assert mask[:history_steps, history_steps].all()
+    assert_equal(mask[:history_steps, :history_steps], torch.ones((history_steps, history_steps)).triu(1).bool())
+    assert not mask[history_steps].any()
+
+    torch.manual_seed(0)
+    n_envs, n_steps = 4, 3
+    train_cfg = go2_train.configure_ult_train_cfg("go2-ult-test", env_cfg)
+    train_cfg["num_steps_per_env"] = n_steps
+    train_cfg["multi_gpu"] = None
+
+    obs_seq = [
+        tensordict.TensorDict(
+            {
+                "proprio_history": torch.randn((n_envs, history_steps, go2_locomotion_env.ULT_PROPRIO_DIM)),
+                "action_history": torch.randn((n_envs, history_steps, 12)),
+                "privilege": torch.randn((n_envs, go2_locomotion_env.ULT_PRIVILEGE_DIM)),
+                "proprio_flat": torch.randn((n_envs, go2_locomotion_env.ULT_PROPRIO_DIM)),
+            },
+            batch_size=[n_envs],
+        )
+        for _ in range(n_steps + 1)
+    ]
+    env = SimpleNamespace(num_envs=n_envs, num_actions=12)
+    alg = ult.ULTPPO.construct_algorithm(obs_seq[0], env, train_cfg, "cpu")
+    dones = torch.tensor([False, True, False, False])
+    with torch.inference_mode():
+        for i_step in range(n_steps):
+            alg.act(obs_seq[i_step])
+            alg.process_env_step(obs_seq[i_step + 1], torch.zeros(n_envs), dones, {})
+
+    storage = alg.storage
+    with torch.no_grad():
+        for i_step in range(n_steps):
+            step_obs = storage.observations[i_step]
+            student_out, teacher_out, _ = alg.actor.forward_heads(step_obs)
+            is_teacher = step_obs["ult_is_teacher"]
+            alg.actor.distribution.update(torch.where(is_teacher, teacher_out, student_out))
+            log_prob = alg.actor.get_output_log_prob(storage.actions[i_step])
+            assert_allclose(log_prob, storage.actions_log_prob[i_step, :, 0], tol=1e-5)
+
+            next_obs = obs_seq[i_step + 1]
+            nsa_target = torch.cat((next_obs["proprio_history"][:, -1], next_obs["action_history"][:, -1]), dim=-1)
+            assert_allclose(step_obs["ult_nsa_target"], nsa_target, tol=0.0)
+            assert_equal(step_obs["ult_is_nsa_valid"][:, 0], ~dones)
+
+            student_obs = step_obs.exclude("privilege")
+            assert_allclose(alg.actor(student_obs), alg.actor.distribution.deterministic_output(student_out), tol=1e-5)
+
+    losses = alg.update()
+    assert all(math.isfinite(value) for value in losses.values())
+    assert losses["ult_nsa"] > 0.0
+    assert losses["ult_imitation"] > 0.0
