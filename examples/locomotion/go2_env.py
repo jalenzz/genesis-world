@@ -13,9 +13,9 @@ from genesis.ext.isaacgym.terrain_utils import (
     pyramid_stairs_terrain,
     random_uniform_terrain,
 )
-from genesis.utils.geom import inv_quat, normalize, quat_to_xyz, transform_by_quat, transform_quat_by_quat
+from genesis.utils.geom import inv_quat, quat_to_xyz, transform_by_quat, transform_quat_by_quat
 
-from cenet import CENet, HISTORY_STEPS, LATENT_DIM, adaboot_uses_truth as adaboot_batch_uses_truth
+from cenet import CENet, HISTORY_STEPS, adaboot_probability
 
 
 def gs_rand(lower, upper, batch_shape):
@@ -33,18 +33,24 @@ SPEED_VX_CAPS = (1.0, 1.25, 1.5, 1.75, 2.0)
 SPEED_PROMOTE_ITERS = 100
 SPEED_TRACK_WINDOW = 50
 SPEED_TRACK_BAR = 0.55
-# Flat-row share mixed into the row weights. Smooth slopes use the smaller share with a squared ramp.
-SMOOTH_FLAT_ROW_SHARE = 0.06
-OTHER_FLAT_ROW_SHARE = 0.12
 # Consecutive episodes above the tracking bar before an obstacle or stair row may rise.
 SLOW_PROMOTE_EPISODES = 8
+# A fresh run spawns uniformly on rows 0 through this one, and the curriculum moves each environment from there.
+MAX_INIT_TERRAIN_LEVEL = 5
+# A contact force above this on the base link counts as a fall.
+BASE_CONTACT_FORCE = 1.0
+# Height samples of the critic, on a grid in the base heading frame (forward x, left y), in meters.
+HEIGHT_SCAN_X = tuple(0.1 * i for i in range(-8, 9))
+HEIGHT_SCAN_Y = tuple(0.1 * i for i in range(-5, 6))
 
 
 class DomainRandomization(NamedTuple):
     friction: tuple[float, float]
     mass_scale: tuple[float, float]
+    # Largest shift of the base center of mass along each axis, in meters.
     com_offset: float
     inertia_scale: tuple[float, float]
+    # Range of the proportional and of the derivative gain factor, each drawn independently.
     gain_scale: tuple[float, float]
     force_scale: tuple[float, float]
     gravity_scale: tuple[float, float]
@@ -56,6 +62,16 @@ class DomainRandomization(NamedTuple):
     system_delay: tuple[float, float] = (0.0, 0.0)
     # Absolute friction coefficient. None keeps `friction` as a ratio of the authored coefficient.
     friction_coefficient: tuple[float, float] | None = None
+
+
+class CurriculumState(NamedTuple):
+    """Speed and terrain curriculum progress saved with a checkpoint."""
+
+    speed_level: int | None
+    speed_iters_at_cap: int
+    speed_tracking_means: list[float]
+    terrain_levels: torch.Tensor
+    promote_streak: torch.Tensor
 
 
 DEFAULT_RANDOMIZATION = DomainRandomization(
@@ -76,31 +92,12 @@ POLICY_MLP = "mlp"
 POLICY_DREAMWAQ = "dreamwaq"
 
 
-def policy_name(env_cfg):
-    """Return the walking policy named in an env config without mutating it.
-
-    ``policy`` is the source of truth. Saved configs may still carry ``estimator="cenet"``; that names the DreamWaQ
-    policy. When neither key is set, the flat MLP walker is assumed.
-    """
-    policy = env_cfg.get("policy")
-    if policy is None and env_cfg.get("estimator") == "cenet":
-        return POLICY_DREAMWAQ
-    if policy is None:
-        return POLICY_MLP
-    return policy
-
-
-def canonicalize_policy_env_cfg(env_cfg):
-    """Write the canonical ``policy`` key and drop legacy ``estimator`` fields."""
-    policy = policy_name(env_cfg)
-    env_cfg.pop("estimator", None)
-    env_cfg["policy"] = policy
-    return policy
-
-
 def is_dreamwaq_policy(env_cfg):
-    """Return whether the env config selects the DreamWaQ actor and context estimator."""
-    return policy_name(env_cfg) == POLICY_DREAMWAQ
+    """Return whether the env config selects the DreamWaQ actor and context estimator.
+
+    The ``policy`` key names the actor, and a config without it selects the flat MLP walker.
+    """
+    return env_cfg.get("policy", POLICY_MLP) == POLICY_DREAMWAQ
 
 
 def locomotion_cfgs():
@@ -203,12 +200,13 @@ def curriculum_reward_scales():
 def dreamwaq_obs_groups():
     """Return the actor and critic observation groups for the DreamWaQ policy.
 
-    The actor reads the current proprioception, the estimated base linear velocity and the latent. The critic reads the
-    proprioception together with the measured base linear velocity and the disturbance.
+    The actor reads the current proprioception, the base linear velocity and the context vector. The critic reads the
+    privileged state: the proprioception, the measured base linear velocity, the disturbance force on the base and the
+    height scan around the base.
     """
     return {
         "actor": ["proprio", "est_vel", "latent"],
-        "critic": ["proprio", "lin_vel", "disturbance"],
+        "critic": ["proprio", "lin_vel", "disturbance", "height_scan"],
     }
 
 
@@ -255,15 +253,18 @@ def format_speed_curriculum(vx_max, iteration, tracking):
 def apply_curriculum(env_cfg, reward_cfg, command_cfg=None):
     """Point a walking config at the terrain curriculum, its rewards, and its domain randomization.
 
-    The flat-ground entry leaves these fields unset. A height field produces more foot contacts than a plane, so the
-    collision budget is raised with the terrain. Set ``env_cfg["policy"]`` separately when the DreamWaQ actor is
-    required. When a command config is passed, forward speed starts in [-1, 1] and its upper end rises with tracking.
-    Lateral speed is drawn from [-0.5, 0.5] and yaw from [-1, 1].
+    The flat-ground entry leaves these fields unset. A fall is a contact on the base, so the roll and pitch limits of
+    the flat walker are dropped: a base aligned with a 22 degree slope is upright. The control delay is the randomized
+    system delay alone. Set ``env_cfg["policy"]`` separately when the DreamWaQ actor is required. When a command config
+    is passed, forward speed starts in [-1, 1] and its upper end rises with tracking. Lateral speed is drawn from
+    [-0.5, 0.5] and yaw from [-1, 1].
     """
     env_cfg["terrain"] = "curriculum"
     env_cfg["domain_randomization"] = True
-    env_cfg["max_collision_pairs"] = 256
     env_cfg["speed_curriculum"] = True
+    env_cfg["simulate_action_latency"] = False
+    del env_cfg["termination_if_roll_greater_than"]
+    del env_cfg["termination_if_pitch_greater_than"]
     env_cfg["randomization"] = {
         "friction": (1.0, 1.0),
         "mass_scale": (1.0, 1.0),
@@ -272,8 +273,6 @@ def apply_curriculum(env_cfg, reward_cfg, command_cfg=None):
         "gain_scale": (0.9, 1.1),
         "force_scale": (0.9, 1.1),
         "gravity_scale": (1.0, 1.0),
-        "push_xy": 0.0,
-        "push_z": 0.0,
         "payload": (-1.0, 2.0),
         "system_delay": (0.0, 0.015),
         "friction_coefficient": (0.2, 1.25),
@@ -366,27 +365,25 @@ def build_curriculum_height_field(
 
 
 class Go2Env:
-    @property
-    def is_dreamwaq_policy(self):
-        return self._policy == POLICY_DREAMWAQ
-
-    def __init__(self, num_envs, env_cfg, obs_cfg, reward_cfg, command_cfg, show_viewer=False):
+    def __init__(self, num_envs, env_cfg, obs_cfg, reward_cfg, command_cfg, show_viewer=False, add_camera=False):
         self.num_envs: int = num_envs
-        self._batch_n = num_envs if num_envs > 0 else 1
+        self.batch_size = num_envs if num_envs > 0 else 1
         self.num_actions = env_cfg["num_actions"]
         self.cfg = env_cfg
         self.num_commands = command_cfg["num_commands"]
         self.device = gs.device
 
-        self.simulate_action_latency = True  # there is a 1 step latency on real robot
+        self.simulate_action_latency = env_cfg["simulate_action_latency"]
         self.dt = 0.02  # control frequency on real robot is 50hz
         self.max_episode_length = math.ceil(env_cfg["episode_length_s"] / self.dt)
+        resampling_time_s = env_cfg["resampling_time_s"]
+        self._resampling_steps = None if resampling_time_s is None else int(resampling_time_s / self.dt)
 
         self.env_cfg = env_cfg
         self.obs_cfg = obs_cfg
         self.reward_cfg = reward_cfg
         self.command_cfg = command_cfg
-        self._policy = canonicalize_policy_env_cfg(self.env_cfg)
+        self._policy = env_cfg.get("policy", POLICY_MLP)
         if self._policy not in (POLICY_MLP, POLICY_DREAMWAQ):
             raise gs.GenesisException(
                 f"Unknown policy '{self._policy}'. Supported policies: '{POLICY_MLP}' and '{POLICY_DREAMWAQ}'."
@@ -394,38 +391,38 @@ class Go2Env:
 
         self.obs_scales: dict[str, float] = obs_cfg["obs_scales"]
         self.reward_scales: dict[str, float] = reward_cfg["reward_scales"]
-        self._terrain_kind = env_cfg.get("terrain", "plane")
+        self.terrain_kind = env_cfg.get("terrain", "plane")
         self._has_domain_randomization = bool(env_cfg.get("domain_randomization", False))
         randomization = env_cfg.get("randomization")
         self._randomization = (
             DEFAULT_RANDOMIZATION if randomization is None else DEFAULT_RANDOMIZATION._replace(**randomization)
         )
+        self._is_terrain_curriculum = env_cfg.get("terrain_curriculum", True)
+        self._is_fall_terminal = env_cfg.get("terminate_on_fall", True)
         self._curriculum_up = env_cfg.get("curriculum_up", 0.8)
         self._curriculum_down = env_cfg.get("curriculum_down", 0.25)
-        self._n_levels = env_cfg.get("terrain_levels", 10)
+        self.n_levels = env_cfg.get("terrain_levels", 10)
         # See difficulty_levels in build_curriculum_height_field. A shorter mesh can keep that slope.
-        self._difficulty_levels = env_cfg.get("terrain_difficulty_levels", self._n_levels)
+        self._difficulty_levels = env_cfg.get("terrain_difficulty_levels", self.n_levels)
         self._subterrain_size = env_cfg.get("terrain_subterrain_size", (8.0, 8.0))
         self._horizontal_scale = env_cfg.get("terrain_horizontal_scale", 0.25)
         self._vertical_scale = env_cfg.get("terrain_vertical_scale", 0.005)
         self._max_slope_deg = env_cfg.get("terrain_max_slope_deg", 22.0)
-        self._terrain_span_x = self._n_levels * self._subterrain_size[0]
+        self._terrain_span_x = self.n_levels * self._subterrain_size[0]
         self._terrain_span_y = len(TERRAIN_KINDS) * self._subterrain_size[1]
 
-        if self._terrain_kind == "curriculum":
-            span_x = self._n_levels * self._subterrain_size[0]
-            span_y = len(TERRAIN_KINDS) * self._subterrain_size[1]
-            camera_pos = (span_x * 0.5, -span_y, max(span_x * 0.35, 2.5))
-            camera_lookat = (span_x * 0.5, span_y * 0.5, 0.0)
+        if self.terrain_kind == "curriculum":
+            camera_pos = (self._terrain_span_x * 0.5, -self._terrain_span_y, max(self._terrain_span_x * 0.35, 2.5))
+            camera_lookat = (self._terrain_span_x * 0.5, self._terrain_span_y * 0.5, 0.0)
         else:
             camera_pos = (2.0, 0.0, 2.5)
             camera_lookat = (0.0, 0.0, 0.5)
 
         # A flat ground fits in 20 pairs. The height field's box covers the whole robot, so every collision geom is a
-        # pair with it and 20 overflows. A pose reset clears that overflow, which hides it.
-        max_collision_pairs = env_cfg.get("max_collision_pairs", 20)
-        if self._terrain_kind == "curriculum" and max_collision_pairs == 20:
-            max_collision_pairs = 256
+        # pair with it and 20 overflows. An overflow halts the step, see the errno check in step.
+        max_collision_pairs = env_cfg.get("max_collision_pairs")
+        if max_collision_pairs is None:
+            max_collision_pairs = 256 if self.terrain_kind == "curriculum" else 20
 
         self.scene = gs.Scene(
             sim_options=gs.options.SimOptions(
@@ -452,11 +449,11 @@ class Go2Env:
         )
 
         self.terrain = None
-        if self._terrain_kind == "curriculum":
+        if self.terrain_kind == "curriculum":
             self.terrain = self.scene.add_entity(
                 gs.morphs.Terrain(
                     height_field=build_curriculum_height_field(
-                        self._n_levels,
+                        self.n_levels,
                         self._subterrain_size,
                         self._horizontal_scale,
                         self._vertical_scale,
@@ -487,6 +484,18 @@ class Go2Env:
             ),
         )
 
+        self.camera = None
+        if add_camera:
+            self.camera = self.scene.add_camera(
+                res=(640, 480),
+                pos=(1.6, -1.6, 1.0),
+                lookat=(0.0, 0.0, 0.3),
+                fov=50,
+                GUI=False,
+                near=0.05,
+                far=30.0,
+            )
+
         self.scene.build(n_envs=num_envs)
 
         # names to indices
@@ -505,7 +514,7 @@ class Go2Env:
 
         # Define global gravity direction vector
         self.global_gravity = torch.tensor([0.0, 0.0, -1.0], dtype=gs.tc_float, device=gs.device)
-        self._world_up = torch.tensor([0.0, 0.0, 1.0], dtype=gs.tc_float, device=gs.device)
+        self._forward_axis = torch.tensor([1.0, 0.0, 0.0], dtype=gs.tc_float, device=gs.device)
         self._nominal_gravity = torch.tensor([0.0, 0.0, -9.81], dtype=gs.tc_float, device=gs.device)
 
         # Initial state
@@ -519,14 +528,9 @@ class Go2Env:
         )
         self.init_qpos = torch.concatenate((self.init_base_pos, self.init_base_quat, self.init_dof_pos))
         self.init_projected_gravity = transform_by_quat(self.global_gravity, self.inv_base_init_quat)
-        self._cell_origins = None
+        self.cell_origins = None
         if self.terrain is not None:
-            self._cell_origins = self._curriculum_origins()
-            # Elevations are already in meters. The pose is fixed, so the height query can reuse it every step.
-            self._height_field = torch.as_tensor(self.terrain.terrain_hf, dtype=gs.tc_float, device=gs.device)
-            self._terrain_pos = self._batch(self.terrain.get_pos()).clone()
-            self._terrain_quat = self._batch(self.terrain.get_quat()).clone()
-            self._terrain_inv_quat = inv_quat(self._terrain_quat)
+            self.cell_origins = self._curriculum_origins()
 
         if self._has_domain_randomization:
             self._nominal_mass = self._shared_nominal(self.robot.get_links_mass())
@@ -545,13 +549,16 @@ class Go2Env:
                 self._nominal_friction = torch.stack(frictions)
 
         # initialize buffers
-        self.base_lin_vel = torch.empty((self._batch_n, 3), dtype=gs.tc_float, device=gs.device)
-        self.base_ang_vel = torch.empty((self._batch_n, 3), dtype=gs.tc_float, device=gs.device)
-        self.projected_gravity = torch.empty((self._batch_n, 3), dtype=gs.tc_float, device=gs.device)
-        self.rew_buf = torch.empty((self._batch_n,), dtype=gs.tc_float, device=gs.device)
-        self.reset_buf = torch.ones((self._batch_n,), dtype=gs.tc_bool, device=gs.device)
-        self.episode_length_buf = torch.zeros((self._batch_n,), dtype=gs.tc_int, device=gs.device)
-        self.commands = torch.empty((self._batch_n, self.num_commands), dtype=gs.tc_float, device=gs.device)
+        self.base_lin_vel = torch.empty((self.batch_size, 3), dtype=gs.tc_float, device=gs.device)
+        self.base_ang_vel = torch.empty((self.batch_size, 3), dtype=gs.tc_float, device=gs.device)
+        self.projected_gravity = torch.empty((self.batch_size, 3), dtype=gs.tc_float, device=gs.device)
+        self.rew_buf = torch.empty((self.batch_size,), dtype=gs.tc_float, device=gs.device)
+        self.reset_buf = torch.ones((self.batch_size,), dtype=gs.tc_bool, device=gs.device)
+        self.is_fallen = torch.zeros((self.batch_size,), dtype=torch.bool, device=gs.device)
+        self.episode_length_buf = torch.zeros((self.batch_size,), dtype=gs.tc_int, device=gs.device)
+        # Steps actually simulated in the episode. A learner may overwrite episode_length_buf with a random start.
+        self._episode_steps = torch.zeros((self.batch_size,), dtype=gs.tc_int, device=gs.device)
+        self.commands = torch.empty((self.batch_size, self.num_commands), dtype=gs.tc_float, device=gs.device)
         self.commands_scale = torch.tensor(
             [self.obs_scales["lin_vel"], self.obs_scales["lin_vel"], self.obs_scales["ang_vel"]],
             device=gs.device,
@@ -565,23 +572,20 @@ class Go2Env:
                 self.command_cfg["ang_vel_range"],
             )
         )
-        self._speed_level = None
+        self._speed_level = 0 if env_cfg.get("speed_curriculum") else None
         self._speed_iters_at_cap = 0
         self._speed_tracking_means = []
-        self._speed_track_sum = 0.0
+        self._speed_track_sum = torch.zeros((), dtype=gs.tc_float, device=gs.device)
         self._speed_track_count = 0
-        if env_cfg.get("speed_curriculum"):
-            self._speed_level = 0
-        self.actions = torch.zeros((self._batch_n, self.num_actions), dtype=gs.tc_float, device=gs.device)
+        self.actions = torch.zeros((self.batch_size, self.num_actions), dtype=gs.tc_float, device=gs.device)
         self.last_actions = torch.zeros_like(self.actions)
         self.last_last_actions = torch.zeros_like(self.actions)
         self.dof_pos = torch.empty_like(self.actions)
         self.dof_vel = torch.empty_like(self.actions)
         self.last_dof_vel = torch.zeros_like(self.actions)
-        self.base_pos = torch.empty((self._batch_n, 3), dtype=gs.tc_float, device=gs.device)
-        self.base_quat = torch.empty((self._batch_n, 4), dtype=gs.tc_float, device=gs.device)
-        self.base_euler = torch.empty((self._batch_n, 3), dtype=gs.tc_float, device=gs.device)
-        self.surface_tip_deg = torch.zeros((self._batch_n,), dtype=gs.tc_float, device=gs.device)
+        self.base_pos = torch.empty((self.batch_size, 3), dtype=gs.tc_float, device=gs.device)
+        self.base_quat = torch.empty((self.batch_size, 4), dtype=gs.tc_float, device=gs.device)
+        self.base_euler = torch.empty((self.batch_size, 3), dtype=gs.tc_float, device=gs.device)
         self.default_dof_pos = torch.tensor(
             [self.env_cfg["default_joint_angles"][name] for name in self.env_cfg["joint_names"]],
             dtype=gs.tc_float,
@@ -589,44 +593,39 @@ class Go2Env:
         )
         self.extras = dict()  # extra information for logging
         kind_weights = torch.tensor(TERRAIN_KIND_FRACTIONS, dtype=gs.tc_float, device=gs.device)
-        self.terrain_types = torch.multinomial(kind_weights, self._batch_n, replacement=True)
-        # Smooth slopes weight a row by the square of its index, so the steep rows take most of that column. The other
-        # columns keep a linear ramp on the row index. Both mixes keep a flat-row share.
-        level_index = torch.arange(self._n_levels, dtype=gs.tc_float, device=gs.device)
-        linear_ramp = (level_index + 1.0) / (level_index + 1.0).sum()
-        squared_ramp = (level_index + 1.0).square()
-        squared_ramp = squared_ramp / squared_ramp.sum()
-        flat_row = torch.zeros((self._n_levels,), dtype=gs.tc_float, device=gs.device)
-        flat_row[0] = 1.0
-        other_level_weights = OTHER_FLAT_ROW_SHARE * flat_row + (1.0 - OTHER_FLAT_ROW_SHARE) * linear_ramp
-        smooth_level_weights = SMOOTH_FLAT_ROW_SHARE * flat_row + (1.0 - SMOOTH_FLAT_ROW_SHARE) * squared_ramp
-        level_weights = other_level_weights.unsqueeze(0).repeat(len(TERRAIN_KINDS), 1)
-        level_weights[TERRAIN_KINDS.index("smooth_slope")] = smooth_level_weights
-        self.terrain_levels = torch.multinomial(level_weights[self.terrain_types], num_samples=1).squeeze(1)
+        self.terrain_types = torch.multinomial(kind_weights, self.batch_size, replacement=True)
+        max_init_level = min(MAX_INIT_TERRAIN_LEVEL, self.n_levels - 1)
+        self.terrain_levels = torch.randint(0, max_init_level + 1, (self.batch_size,), device=gs.device)
         # A set row replaces the sampled row before the first reset.
         initial_level = env_cfg.get("initial_terrain_level")
         if initial_level is not None:
             self.terrain_levels.fill_(initial_level)
-        self._promote_streak = torch.zeros((self._batch_n,), dtype=gs.tc_int, device=gs.device)
+        self._promote_streak = torch.zeros((self.batch_size,), dtype=gs.tc_int, device=gs.device)
         self._obstacle_kind = TERRAIN_KINDS.index("discrete_obstacles")
         self._stair_kind = TERRAIN_KINDS.index("stairs")
-        self.episode_tracking_lin = torch.zeros((self._batch_n,), dtype=gs.tc_float, device=gs.device)
-        self._push_force = torch.zeros((self._batch_n, 3), dtype=gs.tc_float, device=gs.device)
-        self._action_delay = torch.zeros((self._batch_n,), dtype=gs.tc_float, device=gs.device)
+        self.episode_tracking_lin = torch.zeros((self.batch_size,), dtype=gs.tc_float, device=gs.device)
+        self._push_force = torch.zeros((self.batch_size, 3), dtype=gs.tc_float, device=gs.device)
+        self._action_delay = torch.zeros((self.batch_size,), dtype=gs.tc_float, device=gs.device)
         self._cenet = None
         self._cenet_optimizer = None
-        self._finished_returns = []
+        # Count, sum and sum of squares of the episodic returns finished since the last bootstrapping draw.
+        self._finished_return_moments = torch.zeros((3,), dtype=gs.tc_float, device=gs.device)
         self._is_ground_truth = False
         self._is_latent_sampled = False
         self._published_observations = None
         self._proprio_dim = 9 + self.num_actions * 3
+        self._height_scan_offsets = None
         if self.is_dreamwaq_policy:
             self._cenet = CENet(self._proprio_dim).to(device=gs.device, dtype=gs.tc_float)
             self._cenet_optimizer = torch.optim.Adam(self._cenet.parameters(), lr=1.0e-3)
             self._history = torch.zeros(
-                (self._batch_n, HISTORY_STEPS, self._proprio_dim), dtype=gs.tc_float, device=gs.device
+                (self.batch_size, HISTORY_STEPS, self._proprio_dim), dtype=gs.tc_float, device=gs.device
             )
-            self._episode_return = torch.zeros((self._batch_n,), dtype=gs.tc_float, device=gs.device)
+            self._episode_return = torch.zeros((self.batch_size,), dtype=gs.tc_float, device=gs.device)
+            scan_x = torch.tensor(HEIGHT_SCAN_X, dtype=gs.tc_float, device=gs.device)
+            scan_y = torch.tensor(HEIGHT_SCAN_Y, dtype=gs.tc_float, device=gs.device)
+            grid_x, grid_y = torch.meshgrid(scan_x, scan_y, indexing="ij")
+            self._height_scan_offsets = torch.stack((grid_x, grid_y), dim=-1).reshape(-1, 2)
         self._feet_pos = None
         self._feet_vel = None
         self._dof_acc = None
@@ -649,15 +648,59 @@ class Go2Env:
             "similar_to_default": self._reward_similar_to_default,
         }
         # The flat walker folds the control period into each weight. Curriculum weights are the per-step multipliers.
-        scale_by_dt = self._terrain_kind != "curriculum"
+        scale_by_dt = self.terrain_kind != "curriculum"
         self.reward_functions, self.episode_sums = dict(), dict()
         for name in self.reward_scales.keys():
             if scale_by_dt:
                 self.reward_scales[name] *= self.dt
             self.reward_functions[name] = reward_fns[name]
-            self.episode_sums[name] = torch.zeros((self._batch_n,), dtype=gs.tc_float, device=gs.device)
+            self.episode_sums[name] = torch.zeros((self.batch_size,), dtype=gs.tc_float, device=gs.device)
 
         self.reset()
+
+    @property
+    def is_dreamwaq_policy(self):
+        return self._policy == POLICY_DREAMWAQ
+
+    @property
+    def speed_vx_cap(self):
+        """Upper end of the forward command range, or None without the speed curriculum."""
+        if self._speed_level is None:
+            return None
+        return SPEED_VX_CAPS[self._speed_level]
+
+    @property
+    def curriculum_state(self):
+        """Return a copy of the speed and terrain curriculum progress."""
+        return CurriculumState(
+            speed_level=self._speed_level,
+            speed_iters_at_cap=self._speed_iters_at_cap,
+            speed_tracking_means=list(self._speed_tracking_means),
+            terrain_levels=self.terrain_levels.clone(),
+            promote_streak=self._promote_streak.clone(),
+        )
+
+    def load_curriculum_state(self, state, load_terrain):
+        """Restore the curriculum progress saved by `curriculum_state`.
+
+        The forward cap and its promotion window always load. `load_terrain` also restores the terrain row and the
+        promotion streak of every environment, which requires the same number of environments as the saved run.
+        """
+        self._speed_level = state.speed_level
+        self._speed_iters_at_cap = state.speed_iters_at_cap
+        self._speed_tracking_means = list(state.speed_tracking_means)
+        if self._speed_level is not None:
+            self.commands_limits[1][0] = SPEED_VX_CAPS[self._speed_level]
+            self.command_cfg["lin_vel_x_range"][1] = SPEED_VX_CAPS[self._speed_level]
+        if not load_terrain:
+            return
+        if state.terrain_levels.shape != self.terrain_levels.shape:
+            raise gs.GenesisException(
+                f"The checkpoint holds terrain rows for {state.terrain_levels.shape[0]} environments, "
+                f"this run has {self.batch_size}."
+            )
+        self.terrain_levels.copy_(state.terrain_levels)
+        self._promote_streak.copy_(state.promote_streak)
 
     def _shared_nominal(self, value):
         # Batched link and dof info repeats the authored value once per environment. The randomizer scales that value.
@@ -672,17 +715,18 @@ class Go2Env:
 
     def _curriculum_origins(self):
         n_types = len(TERRAIN_KINDS)
-        xs = (torch.arange(self._n_levels, dtype=gs.tc_float, device=gs.device) + 0.5) * self._subterrain_size[0]
+        xs = (torch.arange(self.n_levels, dtype=gs.tc_float, device=gs.device) + 0.5) * self._subterrain_size[0]
         ys = (torch.arange(n_types, dtype=gs.tc_float, device=gs.device) + 0.5) * self._subterrain_size[1]
         grid_x, grid_y = torch.meshgrid(xs, ys, indexing="ij")
-        xy = torch.stack((grid_x, grid_y), dim=-1).reshape(self._n_levels * n_types, 2)
+        xy = torch.stack((grid_x, grid_y), dim=-1).reshape(self.n_levels * n_types, 2)
         heights = self.terrain.get_terrain_height(xy)
         if self.num_envs > 0:
             heights = heights[0]
-        heights = heights.reshape(self._n_levels, n_types)
+        heights = heights.reshape(self.n_levels, n_types)
         return torch.stack((grid_x, grid_y, heights + self.init_base_pos[2]), dim=-1)
 
-    def _terrain_z(self, xy):
+    def terrain_height(self, xy):
+        """Return the ground height under world x-y positions of shape (batch, 2) or (batch, n_points, 2)."""
         if self.terrain is None:
             return torch.zeros(xy.shape[:-1], dtype=gs.tc_float, device=gs.device)
         # A point more than one cell past the height field comes back as NaN and poisons the height rewards.
@@ -699,144 +743,117 @@ class Go2Env:
             return self.terrain.get_terrain_height(xy[:, None, :])[:, 0]
         return self.terrain.get_terrain_height(xy)
 
-    def _terrain_normal(self, xy):
-        """Return the upward unit normal of the height field under each position.
-
-        A cell is two triangles, split on the same diagonal as the height query in kernel_get_terrain_height. The
-        normal is that face. A plane uses world up.
-        """
-        if self.terrain is None:
-            return self._world_up.expand(xy.shape[0], 3)
-        query = torch.stack((xy[:, 0], xy[:, 1], self._terrain_pos[:, 2]), dim=-1)
-        local = transform_by_quat(query - self._terrain_pos, self._terrain_inv_quat)
-        row_max = self._height_field.shape[0] - 1
-        col_max = self._height_field.shape[1] - 1
-        row = (local[:, 0] / self._horizontal_scale).clamp(0.0, row_max)
-        col = (local[:, 1] / self._horizontal_scale).clamp(0.0, col_max)
-        i_row = torch.floor(row).to(dtype=torch.long).clamp(max=row_max - 1)
-        i_col = torch.floor(col).to(dtype=torch.long).clamp(max=col_max - 1)
-        frac_row = row - i_row
-        frac_col = col - i_col
-        h00 = self._height_field[i_row, i_col]
-        h10 = self._height_field[i_row + 1, i_col]
-        h01 = self._height_field[i_row, i_col + 1]
-        h11 = self._height_field[i_row + 1, i_col + 1]
-        is_lower = frac_row + frac_col <= 1.0
-        rise = h00.new_full(h00.shape, self._horizontal_scale)
-        normal_lower = torch.stack((h00 - h10, h00 - h01, rise), dim=-1)
-        normal_upper = torch.stack((h01 - h11, h10 - h11, rise), dim=-1)
-        normal = normalize(torch.where(is_lower.unsqueeze(-1), normal_lower, normal_upper))
-        return transform_by_quat(normal, self._terrain_quat)
-
-    def _surface_tip_deg(self):
-        """Return the angle in degrees between the base up axis and the ground normal."""
-        base_up = transform_by_quat(self._world_up, self.base_quat)
-        normal = self._terrain_normal(self.base_pos[:, :2])
-        return torch.rad2deg(torch.acos((base_up * normal).sum(dim=-1).clamp(-1.0, 1.0)))
+    def _height_scan(self):
+        """Return the base height above each height-scan point, offset and clipped as the critic reads it."""
+        heading = transform_by_quat(self._forward_axis, self.base_quat)[:, :2]
+        heading = heading / torch.linalg.norm(heading, dim=-1, keepdim=True).clamp(min=gs.EPS)
+        offsets_x = self._height_scan_offsets[:, 0]
+        offsets_y = self._height_scan_offsets[:, 1]
+        points_x = heading[:, None, 0] * offsets_x - heading[:, None, 1] * offsets_y
+        points_y = heading[:, None, 1] * offsets_x + heading[:, None, 0] * offsets_y
+        points = self.base_pos[:, None, :2] + torch.stack((points_x, points_y), dim=-1)
+        return (self.base_pos[:, 2:3] - 0.5 - self.terrain_height(points)).clamp(-1.0, 1.0)
 
     def _reset_mask(self, envs_idx):
         if envs_idx is None:
-            return torch.ones((self._batch_n,), dtype=torch.bool, device=gs.device)
+            return torch.ones((self.batch_size,), dtype=torch.bool, device=gs.device)
         return envs_idx
 
     def _sample_interval(self, low, high, shape):
         return (high - low) * torch.rand(shape, dtype=gs.tc_float, device=gs.device) + low
 
+    def _is_episode_complete(self, envs_idx):
+        # The first episode after a random start length has no comparable return or tracking, so it is left out.
+        return self._reset_mask(envs_idx) & (self._episode_steps > 0) & (self._episode_steps == self.episode_length_buf)
+
     def _update_terrain_curriculum(self, envs_idx):
-        if self.terrain is None:
+        if self.terrain is None or not self._is_terrain_curriculum:
             return
-        # The tracking reward saturates at 1. A slope row rises above the upper fraction and falls below the lower one.
-        # Obstacles and stairs rise only after consecutive episodes above the bar, and fall once tracking is below it.
-        finished = self._reset_mask(envs_idx) & (self.episode_length_buf > 0)
-        mean_tracking = self.episode_tracking_lin / self.episode_length_buf.clamp(min=1)
-        is_up = mean_tracking > self._curriculum_up
-        is_down = mean_tracking < self._curriculum_down
+        # A row rises after an episode that lasts to the timeout with mean linear tracking above the upper fraction,
+        # and falls after a fall or a mean below the lower fraction. Obstacles and stairs rise only after consecutive
+        # rising episodes. A row past the last one stays on the last one.
+        is_complete = self._is_episode_complete(envs_idx)
+        is_timeout = self.episode_length_buf > self.max_episode_length
+        mean_tracking = self.episode_tracking_lin / self._episode_steps.clamp(min=1)
+        is_up = is_complete & is_timeout & (mean_tracking > self._curriculum_up)
+        is_down = is_complete & (~is_timeout | (mean_tracking < self._curriculum_down))
         is_slow = (self.terrain_types == self._obstacle_kind) | (self.terrain_types == self._stair_kind)
-        slope_delta = is_up.to(dtype=gs.tc_int) - is_down.to(dtype=gs.tc_int)
-        streak = torch.where(finished & is_slow & is_up, self._promote_streak + 1, self._promote_streak)
-        streak = torch.where(finished & is_slow & ~is_up, torch.zeros_like(streak), streak)
-        is_slow_promote = finished & is_slow & (streak >= SLOW_PROMOTE_EPISODES)
-        streak = torch.where(is_slow_promote, torch.zeros_like(streak), streak)
-        slow_delta = is_slow_promote.to(dtype=gs.tc_int) - (finished & is_slow & is_down).to(dtype=gs.tc_int)
-        delta = torch.where(is_slow, slow_delta, torch.where(finished, slope_delta, torch.zeros_like(slope_delta)))
-        self._promote_streak = streak
-        self.terrain_levels += delta
-        self.terrain_levels.clamp_(0, self._n_levels - 1)
+        streak = torch.where(
+            is_complete & is_slow,
+            torch.where(is_up, self._promote_streak + 1, 0),
+            self._promote_streak,
+        )
+        is_slow_up = is_slow & (streak >= SLOW_PROMOTE_EPISODES)
+        self._promote_streak = torch.where(is_slow_up, 0, streak)
+        is_level_up = torch.where(is_slow, is_slow_up, is_up)
+        self.terrain_levels += torch.where(is_level_up, 1, 0) - torch.where(is_down, 1, 0)
+        self.terrain_levels.clamp_(0, self.n_levels - 1)
 
     def _randomize_domain(self, envs_idx):
         if not self._has_domain_randomization:
             return
-        # Link and dof setters take environment indices, while the reset decision is a mask, so the indices are read
-        # back on the steps an episode actually ends.
         if envs_idx is None:
             env_ids = None
-            count = self._batch_n
+            count = self.batch_size
         else:
-            if self.num_envs == 0:
-                if not bool(envs_idx[0]):
-                    return
-                env_ids = None
-                count = 1
-            else:
-                if not bool(envs_idx.any()):
-                    return
-                env_ids = envs_idx.nonzero(as_tuple=True)[0]
-                count = len(env_ids)
+            # Link and dof setters take environment indices, so the reset mask is read back once.
+            env_ids = torch.nonzero(envs_idx)[:, 0]
+            count = len(env_ids)
+            if count == 0:
+                return
+        setter_ids = env_ids if self.num_envs > 0 else None
         n_links = self.robot.n_links
         ranges = self._randomization
-        link_shape = (n_links,) if self.num_envs == 0 else (count, n_links)
-        dof_shape = (self.num_actions,) if self.num_envs == 0 else (count, self.num_actions)
+
         if ranges.friction_coefficient is None:
-            friction = self._sample_interval(*ranges.friction, link_shape)
+            friction = self._sample_interval(*ranges.friction, (count, n_links))
         else:
             # The setter scales the authored coefficient, so an absolute coefficient becomes that ratio.
-            coefficient = self._sample_interval(*ranges.friction_coefficient, link_shape)
-            friction = coefficient / self._nominal_friction
-        self.robot.set_friction_ratio(friction, envs_idx=env_ids)
-        mass_scale = self._sample_interval(*ranges.mass_scale, link_shape)
-        mass = self._nominal_mass * mass_scale
-        payload = self._sample_interval(*ranges.payload, (count,) if self.num_envs > 0 else ())
+            friction = self._sample_interval(*ranges.friction_coefficient, (count, n_links)) / self._nominal_friction
+        mass = self._nominal_mass * self._sample_interval(*ranges.mass_scale, (count, n_links))
         base_local = self._base_link.idx_local
+        mass[:, base_local] += self._sample_interval(*ranges.payload, (count,))
+        com = self._nominal_com.repeat(count, 1, 1)
+        com[:, base_local] += self._sample_interval(-ranges.com_offset, ranges.com_offset, (count, 3))
+        inertia = self._nominal_inertia * self._sample_interval(*ranges.inertia_scale, (count, n_links, 1, 1))
+        gravity = self._nominal_gravity * self._sample_interval(*ranges.gravity_scale, (count, 1))
+        kp = self.env_cfg["kp"] * self._sample_interval(*ranges.gain_scale, (count, self.num_actions))
+        kd = self.env_cfg["kd"] * self._sample_interval(*ranges.gain_scale, (count, self.num_actions))
+        force_scale = self._sample_interval(*ranges.force_scale, (count, self.num_actions))
         if self.num_envs == 0:
-            mass[base_local] = mass[base_local] + payload
-        else:
-            mass[:, base_local] = mass[:, base_local] + payload
-        self.robot.set_links_mass(mass, envs_idx=env_ids)
-        if self.num_envs == 0:
-            com_offset = (torch.rand((n_links, 3), dtype=gs.tc_float, device=gs.device) * 2.0 - 1.0) * ranges.com_offset
-            inertia_scale = self._sample_interval(*ranges.inertia_scale, (n_links, 1, 1))
-            gravity_scale = self._sample_interval(*ranges.gravity_scale, ())
-        else:
-            com_offset = (
-                torch.rand((count, n_links, 3), dtype=gs.tc_float, device=gs.device) * 2.0 - 1.0
-            ) * ranges.com_offset
-            inertia_scale = self._sample_interval(*ranges.inertia_scale, (count, n_links, 1, 1))
-            gravity_scale = self._sample_interval(*ranges.gravity_scale, (count, 1))
-        self.robot.set_links_COM(self._nominal_com + com_offset, envs_idx=env_ids)
-        self.robot.set_links_inertia(self._nominal_inertia * inertia_scale, envs_idx=env_ids)
-        gain_scale = self._sample_interval(*ranges.gain_scale, dof_shape)
-        self.robot.set_dofs_kp(self.env_cfg["kp"] * gain_scale, self.motors_dof_idx, env_ids)
-        self.robot.set_dofs_kv(self.env_cfg["kd"] * gain_scale, self.motors_dof_idx, env_ids)
-        force_scale = self._sample_interval(*ranges.force_scale, dof_shape)
+            friction, mass, com, inertia, gravity, kp, kd, force_scale = (
+                friction[0],
+                mass[0],
+                com[0],
+                inertia[0],
+                gravity[0],
+                kp[0],
+                kd[0],
+                force_scale[0],
+            )
+        self.robot.set_friction_ratio(friction, envs_idx=setter_ids)
+        self.robot.set_links_mass(mass, envs_idx=setter_ids)
+        self.robot.set_links_COM(com, envs_idx=setter_ids)
+        self.robot.set_links_inertia(inertia, envs_idx=setter_ids)
+        self.robot.set_dofs_kp(kp, self.motors_dof_idx, setter_ids)
+        self.robot.set_dofs_kv(kd, self.motors_dof_idx, setter_ids)
         self.robot.set_dofs_force_range(
             self._nominal_force_lower * force_scale,
             self._nominal_force_upper * force_scale,
             self.motors_dof_idx,
-            env_ids,
+            setter_ids,
         )
-        self.scene.sim.set_gravity(self._nominal_gravity * gravity_scale, envs_idx=env_ids)
+        self.scene.sim.set_gravity(gravity, envs_idx=setter_ids)
+
         push = torch.rand((count, 3), dtype=gs.tc_float, device=gs.device) * 2.0 - 1.0
-        push[:, 0] *= ranges.push_xy
-        push[:, 1] *= ranges.push_xy
+        push[:, :2] *= ranges.push_xy
         push[:, 2] *= ranges.push_z
-        if env_ids is None:
-            self._push_force.copy_(push)
-        else:
-            self._push_force[env_ids] = push
         delay = self._sample_interval(*ranges.system_delay, (count,))
         if env_ids is None:
+            self._push_force.copy_(push)
             self._action_delay.copy_(delay)
         else:
+            self._push_force[env_ids] = push
             self._action_delay[env_ids] = delay
 
     def _apply_push(self):
@@ -848,8 +865,8 @@ class Go2Env:
     def _spawn_qpos(self):
         if self.terrain is None:
             return self.init_qpos
-        qpos = self.init_qpos.unsqueeze(0).repeat(self._batch_n, 1)
-        qpos[:, :3] = self._cell_origins[self.terrain_levels, self.terrain_types]
+        qpos = self.init_qpos.unsqueeze(0).repeat(self.batch_size, 1)
+        qpos[:, :3] = self.cell_origins[self.terrain_levels, self.terrain_types]
         if self.num_envs == 0:
             return qpos[0]
         return qpos
@@ -862,8 +879,8 @@ class Go2Env:
         """
         if self._speed_level is None:
             return None
-        mean_step = self._speed_track_sum / self._speed_track_count
-        self._speed_track_sum = 0.0
+        mean_step = float(self._speed_track_sum) / self._speed_track_count
+        self._speed_track_sum.zero_()
         self._speed_track_count = 0
         self._speed_iters_at_cap += 1
         self._speed_tracking_means.append(mean_step)
@@ -879,11 +896,26 @@ class Go2Env:
         return vx_max, tracking
 
     def _resample_commands(self, envs_idx):
-        commands = gs_rand(*self.commands_limits, (self._batch_n,))
+        commands = gs_rand(*self.commands_limits, (self.batch_size,))
         if envs_idx is None:
             self.commands.copy_(commands)
         else:
             torch.where(envs_idx[:, None], commands, self.commands, out=self.commands)
+
+    def set_commands(self, commands):
+        """Hold velocity commands and republish the current observation with them.
+
+        `commands` holds vx, vy and yaw rate, shared by every environment or given per environment. The proprioceptive
+        history keeps its length: only its newest frame takes the new command.
+        """
+        commands = torch.as_tensor(commands, dtype=gs.tc_float, device=gs.device)
+        if commands.shape != self.commands.shape:
+            commands = commands.reshape(1, -1).expand(self.batch_size, -1)
+        self.commands.copy_(commands)
+        self.obs_buf = self._proprioception()
+        if self.is_dreamwaq_policy:
+            self._history[:, -1] = self.obs_buf
+        return self.get_observations()
 
     def _read_feet_and_motors(self):
         needs_feet = "feet_clearance" in self.reward_functions
@@ -898,11 +930,11 @@ class Go2Env:
 
     def step(self, actions):
         self.actions = torch.clip(actions, -self.env_cfg["clip_actions"], self.env_cfg["clip_actions"])
-        exec_actions = self.last_actions if self.simulate_action_latency else self.actions
-        # A delay shorter than the control period blends the one-step target toward the target before it.
-        if self._has_domain_randomization and bool((self._action_delay > 0).any()):
-            alpha = (self._action_delay / self.dt).clamp(0.0, 1.0).unsqueeze(-1)
-            exec_actions = (1.0 - alpha) * self.last_actions + alpha * self.last_last_actions
+        delayed_actions = self.last_actions if self.simulate_action_latency else self.actions
+        previous_actions = self.last_last_actions if self.simulate_action_latency else self.last_actions
+        # A delay shorter than the control period blends the target toward the one before it. Zero delay keeps it.
+        alpha = (self._action_delay / self.dt).clamp(0.0, 1.0).unsqueeze(-1)
+        exec_actions = delayed_actions + alpha * (previous_actions - delayed_actions)
         target_dof_pos = exec_actions * self.env_cfg["action_scale"] + self.default_dof_pos
         ordered = target_dof_pos[:, self.actions_dof_idx]
         self._apply_push()
@@ -911,6 +943,7 @@ class Go2Env:
 
         # update buffers
         self.episode_length_buf += 1
+        self._episode_steps += 1
         self.base_pos = self._batch(self.robot.get_pos())
         self.base_quat = self._batch(self.robot.get_quat())
         self.base_euler = quat_to_xyz(
@@ -933,23 +966,25 @@ class Go2Env:
             self.rew_buf += rew
             self.episode_sums[name] += rew
             if self._speed_level is not None and name == "tracking_lin_vel":
-                self._speed_track_sum += float(rew.sum())
+                self._speed_track_sum += rew.sum()
                 self._speed_track_count += rew.numel()
         if self.is_dreamwaq_policy:
             self._episode_return += self.rew_buf
 
-        self._resample_commands(self.episode_length_buf % int(self.env_cfg["resampling_time_s"] / self.dt) == 0)
+        if self._resampling_steps is not None:
+            self._resample_commands(self.episode_length_buf % self._resampling_steps == 0)
 
-        # The roll and pitch limits are the tip of the base up axis off the heightfield normal under the base.
-        # On flat ground that normal is world up, so a 10 degree tip still ends the episode.
-        self.surface_tip_deg = self._surface_tip_deg()
+        # A fall is a contact on the base. The flat walker also falls past its roll and pitch limits.
+        base_force = self._batch(self.robot.get_links_net_contact_force())[:, self._base_link.idx_local]
+        self.is_fallen = torch.linalg.norm(base_force, dim=-1) > BASE_CONTACT_FORCE
+        if "termination_if_roll_greater_than" in self.env_cfg:
+            self.is_fallen |= torch.abs(self.base_euler[:, 0]) > self.env_cfg["termination_if_roll_greater_than"]
+            self.is_fallen |= torch.abs(self.base_euler[:, 1]) > self.env_cfg["termination_if_pitch_greater_than"]
         self.reset_buf = self.episode_length_buf > self.max_episode_length
-        self.reset_buf |= self.surface_tip_deg > self.env_cfg["termination_if_roll_greater_than"]
-        self.reset_buf |= self.surface_tip_deg > self.env_cfg["termination_if_pitch_greater_than"]
+        if self._is_fall_terminal:
+            self.reset_buf |= self.is_fallen
         # A pose reset clears errno. Checking it here is what makes an overflow halt instead of respawning forever.
         error_mask = self.scene.rigid_solver.get_error_envs_mask()
-        if error_mask.ndim == 0:
-            error_mask = error_mask.reshape(1)
         if bool(error_mask.any()):
             self.scene.rigid_solver.check_errno()
 
@@ -970,7 +1005,7 @@ class Go2Env:
 
     def get_observations(self):
         if not self.is_dreamwaq_policy:
-            self._published_observations = TensorDict({"policy": self.obs_buf}, batch_size=[self._batch_n])
+            self._published_observations = TensorDict({"policy": self.obs_buf}, batch_size=[self.batch_size])
             return self._published_observations
         velocity, latent = self._velocity_and_latent()
         self._published_observations = TensorDict(
@@ -980,26 +1015,28 @@ class Go2Env:
                 "latent": latent,
                 "lin_vel": self.base_lin_vel,
                 "disturbance": self._push_force,
+                "height_scan": self._height_scan(),
                 "history": self._history,
             },
-            batch_size=[self._batch_n],
+            batch_size=[self.batch_size],
         )
         return self._published_observations
 
     def _velocity_and_latent(self):
-        """Return the base velocity and latent the actor reads on this step."""
-        if self._is_ground_truth:
-            # The latent has no measured value. Zero is the mean of its standard normal prior.
-            latent = torch.zeros((self._batch_n, LATENT_DIM), dtype=gs.tc_float, device=gs.device)
-            return self.base_lin_vel, latent
+        """Return the base velocity and context vector the actor reads on this step.
+
+        Adaptive bootstrapping swaps the velocity alone: the measured one without bootstrapping, the estimated one with
+        it. The context vector has no measured counterpart and always comes from the estimator.
+        """
         # The history can be an inference tensor from the rollout. Autograd has to save a normal tensor.
         history = self._history.detach().clone()
         belief = self._cenet.encode(history)
         latent = self._cenet.reparameterize(belief) if self._is_latent_sampled else belief.mean
-        return belief.velocity.detach(), latent.detach()
+        velocity = self.base_lin_vel if self._is_ground_truth else belief.velocity
+        return velocity.detach(), latent.detach()
 
     def set_estimator_ground_truth(self, use_ground_truth):
-        """Choose measured velocity or the estimator for the actor, including the observation already published."""
+        """Feed the actor the measured or the estimated velocity, including in the observation already published."""
         self._is_ground_truth = use_ground_truth
         if not self.is_dreamwaq_policy or self._published_observations is None:
             return
@@ -1008,16 +1045,24 @@ class Go2Env:
         self._published_observations["latent"] = latent
 
     def set_latent_sampling(self, sample_latent):
-        """Sample the latent during a rollout, or publish its mean."""
+        """Sample the context vector during a rollout, or publish its mean."""
         self._is_latent_sampled = sample_latent
 
     def adaboot_uses_truth(self):
-        """Return whether the next batch should read ground truth, from the returns finished in this batch."""
-        if not self.is_dreamwaq_policy or len(self._finished_returns) == 0:
+        """Draw whether the next rollout feeds the actor the measured velocity, see adaboot_probability in cenet.py.
+
+        The draw reads the episodic returns finished since the previous draw. Without any, the actor reads the measured
+        velocity.
+        """
+        if not self.is_dreamwaq_policy:
             return True
-        returns = torch.cat(self._finished_returns)
-        self._finished_returns.clear()
-        return adaboot_batch_uses_truth(returns, torch.rand((), dtype=gs.tc_float, device=gs.device))
+        count, total, total_square = self._finished_return_moments
+        self._finished_return_moments.zero_()
+        if count < 0.5:
+            return True
+        mean = total / count
+        std = (total_square / count - mean.square()).clamp(min=0.0).sqrt()
+        return bool(torch.rand((), device=gs.device) >= adaboot_probability(mean, std))
 
     def update_estimator(self, storage):
         """Fit the context estimator on one rollout and return its loss.
@@ -1071,9 +1116,10 @@ class Go2Env:
 
         # reset buffers
         if self.is_dreamwaq_policy:
-            finished_mask = self._reset_mask(envs_idx) & (self.episode_length_buf > 0)
-            if bool(finished_mask.any()):
-                self._finished_returns.append(self._episode_return[finished_mask].detach().clone())
+            # Running moments keep the step free of a device read and the memory bounded between two draws.
+            is_complete = self._is_episode_complete(envs_idx)
+            returns = torch.where(is_complete, self._episode_return, 0.0)
+            self._finished_return_moments += torch.stack((is_complete.sum(), returns.sum(), returns.square().sum()))
         if envs_idx is None:
             self.base_pos.copy_(self.init_base_pos)
             self.base_quat.copy_(self.init_base_quat)
@@ -1086,6 +1132,7 @@ class Go2Env:
             self.last_actions.zero_()
             self.last_last_actions.zero_()
             self.episode_length_buf.zero_()
+            self._episode_steps.zero_()
             self.episode_tracking_lin.zero_()
             self.reset_buf.fill_(True)
             if self.is_dreamwaq_policy:
@@ -1104,20 +1151,21 @@ class Go2Env:
             self.last_actions.masked_fill_(envs_idx[:, None], 0.0)
             self.last_last_actions.masked_fill_(envs_idx[:, None], 0.0)
             self.episode_length_buf.masked_fill_(envs_idx, 0)
+            self._episode_steps.masked_fill_(envs_idx, 0)
             self.episode_tracking_lin.masked_fill_(envs_idx, 0.0)
             self.reset_buf.masked_fill_(envs_idx, True)
             if self.is_dreamwaq_policy:
                 self._episode_return.masked_fill_(envs_idx, 0.0)
 
         if self.terrain is not None:
-            origin = self._cell_origins[self.terrain_levels, self.terrain_types]
+            origin = self.cell_origins[self.terrain_levels, self.terrain_types]
             if envs_idx is None:
                 self.base_pos.copy_(origin)
             else:
                 torch.where(envs_idx[:, None], origin, self.base_pos, out=self.base_pos)
 
         # fill extras
-        n_envs = envs_idx.sum() if envs_idx is not None else self._batch_n
+        n_envs = envs_idx.sum() if envs_idx is not None else self.batch_size
         self.extras["episode"] = {}
         for key, value in self.episode_sums.items():
             if envs_idx is None:
@@ -1133,8 +1181,8 @@ class Go2Env:
         # random sample command upon reset
         self._resample_commands(envs_idx)
 
-    def _update_observation(self):
-        self.obs_buf = torch.concatenate(
+    def _proprioception(self):
+        return torch.concatenate(
             (
                 self.base_ang_vel * self.obs_scales["ang_vel"],  # 3
                 self.projected_gravity,  # 3
@@ -1145,6 +1193,9 @@ class Go2Env:
             ),
             dim=-1,
         )
+
+    def _update_observation(self):
+        self.obs_buf = self._proprioception()
         if not self.is_dreamwaq_policy:
             return
         assert self.obs_buf.shape[-1] == self._proprio_dim
@@ -1209,12 +1260,12 @@ class Go2Env:
 
     def _reward_base_height(self):
         # Penalize base height away from target, measured above the ground under the base
-        height = self.base_pos[:, 2] - self._terrain_z(self.base_pos[:, :2])
+        height = self.base_pos[:, 2] - self.terrain_height(self.base_pos[:, :2])
         return torch.square(height - self.reward_cfg["base_height_target"])
 
     def _reward_feet_clearance(self):
         # Penalize swing feet whose height above the terrain misses the clearance target. Stance speed is ~0.
-        clearance = self._feet_pos[..., 2] - self._terrain_z(self._feet_pos[..., :2])
+        clearance = self._feet_pos[..., 2] - self.terrain_height(self._feet_pos[..., :2])
         speed = torch.linalg.norm(self._feet_vel[..., :2], dim=-1)
         return torch.sum(torch.square(clearance - self.reward_cfg["feet_height_target"]) * speed, dim=1)
 

@@ -12,7 +12,7 @@ except (metadata.PackageNotFoundError, ImportError) as e:
 
 import genesis as gs
 
-from dreamwaq import DreamWaQRunner, SpeedCurriculumRunner
+from dreamwaq import CurriculumRunner
 from go2_env import (
     POLICY_DREAMWAQ,
     POLICY_MLP,
@@ -27,7 +27,7 @@ from go2_env import (
 def get_train_cfg(exp_name):
     train_cfg_dict = {
         "algorithm": {
-            "class_name": "PPO",
+            "class_name": "dreamwaq:CurriculumPPO",
             "clip_param": 0.2,
             "desired_kl": 0.01,
             "entropy_coef": 0.01,
@@ -70,9 +70,15 @@ def get_train_cfg(exp_name):
 
 
 def configure_train_cfg(exp_name, env_cfg):
-    """Return the runner config, with DreamWaQ observation groups when that policy is selected."""
+    """Return the runner config, with DreamWaQ observation groups when that policy is selected.
+
+    The DreamWaQ actor and critic normalize their inputs to zero mean and unit variance.
+    """
     train_cfg = get_train_cfg(exp_name)
     train_cfg["obs_groups"] = policy_obs_groups(env_cfg)
+    if is_dreamwaq_policy(env_cfg):
+        train_cfg["actor"]["obs_normalization"] = True
+        train_cfg["critic"]["obs_normalization"] = True
     return train_cfg
 
 
@@ -87,7 +93,10 @@ def main():
         "--resume",
         type=str,
         default="",
-        help="Checkpoint to load. Learning continues after it, and the log directory keeps its earlier files.",
+        help=(
+            "Checkpoint to load. Learning continues after it with the configs saved in the log directory, the "
+            "curricula and the context estimator included, and the log directory keeps its earlier files."
+        ),
     )
     parser.add_argument(
         "--learning-rate",
@@ -99,43 +108,56 @@ def main():
     parser.add_argument(
         "--terrain",
         choices=("plane", "curriculum"),
-        default="curriculum",
+        default=None,
         help=(
-            "Ground under the robot. 'curriculum' starts vx in [-1, 1] and raises the upper end with tracking, "
-            "draws vy from [-0.5, 0.5] and yaw from [-1, 1], and moves each terrain row up or down from tracking. "
-            "'plane' keeps the flat walker and its fixed forward command."
+            "Ground under the robot, 'curriculum' by default. 'curriculum' starts vx in [-1, 1] and raises the upper "
+            "end with tracking, draws vy from [-0.5, 0.5] and yaw from [-1, 1], and moves each terrain row up or down "
+            "from tracking. 'plane' keeps the flat walker and its fixed forward command. A resume must match the "
+            "saved value."
         ),
     )
     parser.add_argument(
         "--policy",
         choices=(POLICY_MLP, POLICY_DREAMWAQ),
         default=None,
-        help="Actor policy. Defaults to dreamwaq with --terrain curriculum and mlp with plane.",
+        help=(
+            "Actor policy. Defaults to dreamwaq with --terrain curriculum and mlp with plane. A resume must match the "
+            "saved value."
+        ),
     )
     args = parser.parse_args()
 
     log_dir = f"logs/{args.exp_name}"
-    env_cfg, obs_cfg, reward_cfg, command_cfg = locomotion_cfgs()
-    if args.terrain == "curriculum":
-        apply_curriculum(env_cfg, reward_cfg, command_cfg)
-    if args.policy is not None:
-        env_cfg["policy"] = args.policy
-    elif args.terrain == "curriculum":
-        env_cfg["policy"] = POLICY_DREAMWAQ
+    if args.resume:
+        with open(f"{log_dir}/cfgs.pkl", "rb") as f:
+            env_cfg, obs_cfg, reward_cfg, command_cfg, train_cfg = pickle.load(f)
+        saved_terrain = env_cfg.get("terrain", "plane")
+        saved_policy = env_cfg.get("policy", POLICY_MLP)
+        if args.terrain not in (None, saved_terrain) or args.policy not in (None, saved_policy):
+            raise SystemExit(
+                f"--terrain {args.terrain} --policy {args.policy} differ from the saved terrain '{saved_terrain}' "
+                f"and policy '{saved_policy}' of {log_dir}."
+            )
     else:
-        env_cfg["policy"] = POLICY_MLP
-    train_cfg = configure_train_cfg(args.exp_name, env_cfg)
-    if args.learning_rate is not None:
-        train_cfg["algorithm"]["learning_rate"] = args.learning_rate
-        train_cfg["algorithm"]["schedule"] = "fixed"
-
-    # The resume checkpoint usually lives in this log directory.
-    if os.path.exists(log_dir) and not args.resume:
-        shutil.rmtree(log_dir)
-    os.makedirs(log_dir, exist_ok=True)
-
-    with open(f"{log_dir}/cfgs.pkl", "wb") as f:
-        pickle.dump([env_cfg, obs_cfg, reward_cfg, command_cfg, train_cfg], f)
+        terrain = "curriculum" if args.terrain is None else args.terrain
+        env_cfg, obs_cfg, reward_cfg, command_cfg = locomotion_cfgs()
+        if terrain == "curriculum":
+            apply_curriculum(env_cfg, reward_cfg, command_cfg)
+        if args.policy is not None:
+            env_cfg["policy"] = args.policy
+        elif terrain == "curriculum":
+            env_cfg["policy"] = POLICY_DREAMWAQ
+        else:
+            env_cfg["policy"] = POLICY_MLP
+        train_cfg = configure_train_cfg(args.exp_name, env_cfg)
+        if args.learning_rate is not None:
+            train_cfg["algorithm"]["learning_rate"] = args.learning_rate
+            train_cfg["algorithm"]["schedule"] = "fixed"
+        if os.path.exists(log_dir):
+            shutil.rmtree(log_dir)
+        os.makedirs(log_dir)
+        with open(f"{log_dir}/cfgs.pkl", "wb") as f:
+            pickle.dump([env_cfg, obs_cfg, reward_cfg, command_cfg, train_cfg], f)
 
     # Training throughput comes from the 4096 parallel environments, which need a GPU.
     gs.init(backend=gs.gpu, precision="32", logging_level="warning", seed=args.seed, performance_mode=True)
@@ -144,8 +166,7 @@ def main():
         num_envs=args.num_envs, env_cfg=env_cfg, obs_cfg=obs_cfg, reward_cfg=reward_cfg, command_cfg=command_cfg
     )
 
-    runner_cls = DreamWaQRunner if is_dreamwaq_policy(env_cfg) else SpeedCurriculumRunner
-    runner = runner_cls(env, train_cfg, log_dir, device=gs.device)
+    runner = CurriculumRunner(env, train_cfg, log_dir, device=gs.device)
     if args.resume:
         runner.load(args.resume)
         # The file stores the iteration just finished. The learning loop starts at that index.
