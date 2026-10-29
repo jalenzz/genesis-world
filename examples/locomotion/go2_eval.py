@@ -1,4 +1,5 @@
 import argparse
+import math
 import os
 import pickle
 import time
@@ -393,10 +394,11 @@ def run_teleop(args):
         terrain_level=args.terrain_level,
         pin_easiest=True,
     )
-    # 180 degrees is the largest angle between two axes, so the tilt check stays idle. The timeout still
-    # ends the episode.
+    # 180 degrees is the largest angle between two axes, so the tilt check stays idle. An infinite episode length
+    # keeps the timeout idle too, so only R resets the robot.
     env.env_cfg["termination_if_roll_greater_than"] = 180.0
     env.env_cfg["termination_if_pitch_greater_than"] = 180.0
+    env.max_episode_length = math.inf
 
     def axis_keybinds(name, key, held_name):
         return (
@@ -405,10 +407,16 @@ def run_teleop(args):
         )
 
     is_running = True
+    is_reset_requested = False
 
     def stop():
         nonlocal is_running
         is_running = False
+
+    # The viewer runs callbacks inside the step, so the reset waits for the loop.
+    def request_reset():
+        nonlocal is_reset_requested
+        is_reset_requested = True
 
     env.scene.viewer.register_keybinds(
         *axis_keybinds("forward", Key.W, "w"),
@@ -417,6 +425,7 @@ def run_teleop(args):
         *axis_keybinds("strafe_right", Key.E, "e"),
         *axis_keybinds("yaw_left", Key.A, "a"),
         *axis_keybinds("yaw_right", Key.D, "d"),
+        Keybind("reset", Key.R, KeyAction.RELEASE, callback=request_reset),
         Keybind("quit", Key.ESCAPE, KeyAction.RELEASE, callback=stop),
         overwrite=True,
     )
@@ -441,7 +450,7 @@ def run_teleop(args):
     print(
         f"ckpt={ckpt_path} pad={pad_name} deadzone={STICK_DEADZONE} "
         f"vx=-axis{LEFT_STICK_Y} vy=-axis{LEFT_STICK_X} yaw=-axis{RIGHT_STICK_X} "
-        "keys W/S vx, Q/E vy, A/D yaw, Esc quit"
+        "keys W/S vx, Q/E vy, A/D yaw, R reset, Esc quit"
     )
 
     obs_dict = env.reset()
@@ -460,7 +469,10 @@ def run_teleop(args):
     with torch.no_grad():
         while is_running and env.scene.viewer.is_alive():
             actions = policy(obs_dict)
-            obs_dict, _rews, _dones, _infos = env.step(actions)
+            env.step(actions)
+            if is_reset_requested:
+                env.reset()
+                is_reset_requested = False
             obs_dict = _publish_command(env, command())
 
 
