@@ -111,8 +111,10 @@ def test_curriculum_config(locomotion):
     assert_allclose(scales["tracking_ang_vel"], 0.5, atol=0.0, rtol=0.0)
     assert_allclose(scales["lin_vel_z"], -2.0, atol=0.0, rtol=0.0)
     assert_allclose(scales["feet_clearance"], -0.01, atol=0.0, rtol=0.0)
+    assert_allclose(scales["ang_vel_xy"], -0.1, atol=0.0, rtol=0.0)
+    assert_allclose(scales["orientation"], -1.0, atol=0.0, rtol=0.0)
+    assert_allclose(scales["similar_to_default"], -0.1, atol=0.0, rtol=0.0)
     assert "feet_air_time" not in scales
-    assert "similar_to_default" not in scales
     assert_allclose(command_cfg["lin_vel_x_range"], [-1.0, 1.0], atol=0.0, rtol=0.0)
     assert_allclose(command_cfg["lin_vel_y_range"], [-0.5, 0.5], atol=0.0, rtol=0.0)
     assert_allclose(command_cfg["ang_vel_range"], [-1.0, 1.0], atol=0.0, rtol=0.0)

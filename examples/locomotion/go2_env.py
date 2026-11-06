@@ -183,14 +183,14 @@ def curriculum_reward_scales():
 
     Each weight multiplies its term once per control step. Linear and yaw tracking are exponentials of the squared
     velocity error. The remaining terms penalize vertical and roll-pitch velocity, body tilt, joint acceleration,
-    motor power, body height, foot clearance, action changes, and uneven motor power.
+    motor power, body height, foot clearance, action changes, uneven motor power, and joint pose away from default.
     """
     return {
         "tracking_lin_vel": 1.0,
         "tracking_ang_vel": 0.5,
         "lin_vel_z": -2.0,
-        "ang_vel_xy": -0.05,
-        "orientation": -0.2,
+        "ang_vel_xy": -0.1,
+        "orientation": -1.0,
         "dof_acc": -2.5e-7,
         "joint_power": -2.0e-5,
         "base_height": -1.0,
@@ -198,6 +198,7 @@ def curriculum_reward_scales():
         "action_rate": -0.01,
         "action_smoothness": -0.01,
         "power_distribution": -1.0e-5,
+        "similar_to_default": -0.1,
     }
 
 
@@ -1256,8 +1257,8 @@ class Go2Env:
         return torch.sum(torch.square(self.base_ang_vel[:, :2]), dim=1)
 
     def _reward_orientation(self):
-        # Penalize the squared norm of gravity in the body frame
-        return torch.sum(torch.square(self.projected_gravity), dim=1)
+        # Penalize tilt: the squared horizontal part of gravity in the body frame.
+        return torch.sum(torch.square(self.projected_gravity[:, :2]), dim=1)
 
     def _reward_dof_acc(self):
         # Penalize joint acceleration
