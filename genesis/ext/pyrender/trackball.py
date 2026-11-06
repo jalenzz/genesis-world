@@ -245,12 +245,21 @@ class Trackball(object):
         x_rot_mat = transformations.rotation_matrix(azimuth, y_axis, target)
         self._pose = x_rot_mat @ self._pose
 
-    def set_camera_pose(self, pose):
+    def set_camera_pose(self, pose, target=None):
         """Set the camera pose.
 
         Parameters
         ----------
         pose : [4,4]
             The camera pose.
+        target : (3,) float, optional
+            Orbit center. Scroll and drag keep the previous center when this is omitted.
         """
-        self._n_pose = pose
+        # Scroll and drag rebuild the view from the pose and the target captured at the pointer press.
+        pose = np.array(pose, copy=True)
+        self._pose = pose
+        self._n_pose = pose.copy()
+        if target is not None:
+            target = np.array(target, dtype=np.float64, copy=True)
+            self._target = target
+            self._n_target = target.copy()

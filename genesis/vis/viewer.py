@@ -265,7 +265,7 @@ class Viewer(RBC):
             split_envs=split_envs,
         )
 
-    def set_camera_pose(self, pose=None, pos=None, lookat=None):
+    def set_camera_pose(self, pose=None, pos=None, lookat=None, up=None):
         """
         Set viewer camera pose.
 
@@ -276,21 +276,28 @@ class Viewer(RBC):
         pos : array-like, shape (3,), optional
             Camera position.
         lookat : array-like, shape (3,), optional
-            Camera lookat point.
+            Camera lookat point. The trackball orbits this point afterwards.
+        up : array-like, shape (3,), optional
+            Camera up direction used with `pos` and `lookat`. The viewer's stored up is used when omitted.
         """
+        target = None
         if pose is None:
             pos = self._camera_init_pos if pos is None else tensor_to_array(pos, dtype=gs.np_float)
             lookat = self._camera_init_lookat if lookat is None else tensor_to_array(lookat, dtype=gs.np_float)
-            up = self._camera_up
+            if up is None:
+                up = self._camera_up
+            else:
+                up = tensor_to_array(up, dtype=gs.np_float)
 
             pose = gu.pos_lookat_up_to_T(pos, lookat, up)
             self._camera_up = pose[:3, 1].copy()
+            target = lookat
         else:
             pose = tensor_to_array(pose, dtype=gs.np_float)
             if pose.shape != (4, 4):
                 gs.raise_exception("pose should be a 4x4 matrix.")
 
-        self._pyrender_viewer._trackball.set_camera_pose(pose)
+        self._pyrender_viewer._trackball.set_camera_pose(pose, target=target)
 
     def follow_entity(self, entity, fixed_axis=(None, None, None), smoothing=None, fix_orientation=False):
         """
