@@ -110,9 +110,9 @@ def test_curriculum_config(locomotion):
     assert_allclose(scales["tracking_lin_vel"], 1.5, atol=0.0, rtol=0.0)
     assert_allclose(scales["tracking_ang_vel"], 0.5, atol=0.0, rtol=0.0)
     assert_allclose(scales["lin_vel_z"], -2.0, atol=0.0, rtol=0.0)
-    assert_allclose(scales["base_height"], -70.0, atol=0.0, rtol=0.0)
-    assert_allclose(scales["feet_clearance"], -300.0, atol=0.0, rtol=0.0)
-    assert_allclose(scales["feet_placement"], -20.0, atol=0.0, rtol=0.0)
+    assert_allclose(scales["base_height"], -1.0, atol=0.0, rtol=0.0)
+    assert_allclose(scales["feet_clearance"], -0.01, atol=0.0, rtol=0.0)
+    assert_allclose(scales["feet_placement"], -50.0, atol=0.0, rtol=0.0)
     assert_allclose(scales["ang_vel_xy"], -0.1, atol=0.0, rtol=0.0)
     assert_allclose(scales["orientation"], -1.0, atol=0.0, rtol=0.0)
     assert_allclose(scales["similar_to_default"], -0.05, atol=0.0, rtol=0.0)
@@ -251,6 +251,18 @@ def test_dreamwaq_terrain_rows(n_envs, show_viewer, locomotion):
     env.step(actions)
     assert not bool(env.is_fallen.any())
     assert not bool(env.reset_buf.any())
+
+    # Placement charges a foot only on the step it lands. A foot already down costs nothing, however far it is.
+    env.reset()
+    for _ in range(20):
+        env.step(actions)
+    assert bool(env._foot_contact.all())
+    assert not bool(env._touchdown.any())
+    assert_allclose(env._reward_feet_placement(), 0.0, atol=0.0, rtol=0.0)
+    env._foot_contact.zero_()
+    env.step(actions)
+    assert bool(env._touchdown.all())
+    assert (env._reward_feet_placement() > 0.0).all()
 
     # Close the stair episode while the horizon is still long, then shorten it. The following reset sees no lived steps.
     env.reset()

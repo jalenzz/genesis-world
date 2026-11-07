@@ -94,9 +94,11 @@ FOOT_LINK_NAMES = ("FR_foot", "FL_foot", "RR_foot", "RL_foot")
 # Thigh joints, in the same order as the feet. The foot hangs from this joint, so it is the hip of the placement
 # target. The hip link is inboard by the abduction offset, and a target there charges a correct stance.
 HIP_LINK_NAMES = ("FR_thigh", "FL_thigh", "RR_thigh", "RL_thigh")
-# Stance duration, in seconds. The env has no gait clock. The placement target leads the hip by half of this times
-# the horizontal base velocity.
-STANCE_DURATION = 0.25
+# Stance duration, in seconds. The placement target leads the hip by half of this times the horizontal base velocity.
+# Checkpoint 15999 holds a stance of 0.18 to 0.20 s at 0.5 to 1.25 m/s on flat ground, with duty near 0.5.
+STANCE_DURATION = 0.2
+# A foot pressing on the ground harder than this, in newtons, is in contact
+FOOT_CONTACT_FORCE = 1.0
 
 POLICY_MLP = "mlp"
 POLICY_DREAMWAQ = "dreamwaq"
@@ -192,11 +194,10 @@ def curriculum_reward_scales():
     motor power, base height, foot clearance, foot placement, action changes, uneven motor power, and joint pose
     away from default.
 
-    Clearance only sees swing-foot height and horizontal foot speed, so a base that drops while the feet keep that
-    swing is free. Base height is what holds the base on its target. Either weight, set past the linear-tracking
-    step, spends the step on height and the commanded velocity drops. Placement pulls every foot toward its hip plus
-    half a stance of horizontal base velocity, and a miss behind the hip costs the same as any other miss of that
-    size. A heavier placement weight pins the feet to the target and the step length collapses.
+    Base height and clearance keep the weights of checkpoint 15999. Its base holds 0.36 m against the 0.30 m target,
+    so a heavier height weight pulls the base down, and clearance multiplies by foot speed, so a heavier clearance
+    weight charges every fast swing. Placement charges the touchdown step only. On 15999 it averages 0.002 a step on
+    flat ground at 0.5 to 1.25 m/s and 0.008 on row 4 at 1.25 m/s, about the same at every speed.
     """
     return {
         "tracking_lin_vel": 1.5,
@@ -206,9 +207,9 @@ def curriculum_reward_scales():
         "orientation": -1.0,
         "dof_acc": -2.5e-7,
         "joint_power": -2.0e-5,
-        "base_height": -70.0,
-        "feet_clearance": -300.0,
-        "feet_placement": -20.0,
+        "base_height": -1.0,
+        "feet_clearance": -0.01,
+        "feet_placement": -50.0,
         "action_rate": -0.01,
         "action_smoothness": -0.01,
         "power_distribution": -1.0e-5,
@@ -650,6 +651,8 @@ class Go2Env:
         self._feet_pos = None
         self._feet_vel = None
         self._hip_pos = None
+        self._foot_contact = torch.zeros((self.batch_size, len(FOOT_LINK_NAMES)), dtype=torch.bool, device=gs.device)
+        self._touchdown = torch.zeros_like(self._foot_contact)
         self._dof_acc = None
         self._motor_torque = None
         self._motor_power = None
@@ -960,6 +963,10 @@ class Go2Env:
             self._feet_vel = self._batch(self.robot.get_links_vel(self._feet_idx))
         if "feet_placement" in self.reward_functions:
             self._hip_pos = self._batch(self.robot.get_links_pos(self._hip_idx))
+            feet_force = self._batch(self.robot.get_links_net_contact_force())[:, self._feet_idx]
+            contact = torch.linalg.norm(feet_force, dim=-1) > FOOT_CONTACT_FORCE
+            torch.logical_and(contact, ~self._foot_contact, out=self._touchdown)
+            self._foot_contact.copy_(contact)
         if "dof_acc" in self.reward_functions:
             self._dof_acc = self._batch(self.robot.get_dofs_acc(self.motors_dof_idx))
         if "joint_power" in self.reward_functions or "power_distribution" in self.reward_functions:
@@ -1189,6 +1196,7 @@ class Go2Env:
             self.episode_length_buf.zero_()
             self._episode_steps.zero_()
             self.episode_tracking_lin.zero_()
+            self._foot_contact.zero_()
             self.reset_buf.fill_(True)
             if self.is_dreamwaq_policy:
                 self._episode_return.zero_()
@@ -1208,6 +1216,7 @@ class Go2Env:
             self.episode_length_buf.masked_fill_(envs_idx, 0)
             self._episode_steps.masked_fill_(envs_idx, 0)
             self.episode_tracking_lin.masked_fill_(envs_idx, 0.0)
+            self._foot_contact.masked_fill_(envs_idx[:, None], False)
             self.reset_buf.masked_fill_(envs_idx, True)
             if self.is_dreamwaq_policy:
                 self._episode_return.masked_fill_(envs_idx, 0.0)
@@ -1325,11 +1334,13 @@ class Go2Env:
         return torch.sum(torch.square(clearance - self.reward_cfg["feet_height_target"]) * speed, dim=1)
 
     def _reward_feet_placement(self):
-        # Penalize the squared horizontal miss of every foot from its hip plus half a stance of base velocity.
-        # The square charges a foot behind the hip the same as the same distance in any other direction.
+        # Penalize the squared horizontal miss of a foot from its hip plus half a stance of base velocity, on the step
+        # the foot touches down. Only touchdown has this target: through stance the foot slides behind the hip by
+        # velocity times stance, so a per-step charge grows with speed and pays the policy to walk slower.
         horizontal_vel = transform_by_quat(self.base_lin_vel, self.base_quat)[:, :2]
         target = self._hip_pos[..., :2] + horizontal_vel[:, None, :] * (STANCE_DURATION * 0.5)
-        return torch.sum(torch.square(self._feet_pos[..., :2] - target), dim=(1, 2))
+        miss = torch.sum(torch.square(self._feet_pos[..., :2] - target), dim=-1)
+        return torch.sum(miss * self._touchdown, dim=1)
 
     def _reward_power_distribution(self):
         # Penalize the square of the variance of signed joint power across the motors
