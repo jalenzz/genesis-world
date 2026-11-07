@@ -28,8 +28,8 @@ TERRAIN_KINDS = ("smooth_slope", "rough_slope", "discrete_obstacles", "stairs")
 # Episode share of each column: smooth slope, rough slope, discrete obstacles, stairs.
 TERRAIN_KIND_FRACTIONS = (0.48, 0.20, 0.12, 0.20)
 # Forward caps, in order. Sampling uses [-1, cap]. A cap rises after 100 iterations when the mean of the last 50
-# per-step linear tracking rewards is at least 0.55.
-SPEED_VX_CAPS = (1.0, 1.25, 1.5, 1.75, 2.0)
+# per-step linear tracking rewards is at least 0.55. 1.25 is the last cap, so it stays in place.
+SPEED_VX_CAPS = (1.0, 1.25)
 SPEED_PROMOTE_ITERS = 100
 SPEED_TRACK_WINDOW = 50
 SPEED_TRACK_BAR = 0.55
@@ -186,7 +186,7 @@ def curriculum_reward_scales():
     motor power, body height, foot clearance, action changes, uneven motor power, and joint pose away from default.
     """
     return {
-        "tracking_lin_vel": 1.0,
+        "tracking_lin_vel": 1.5,
         "tracking_ang_vel": 0.5,
         "lin_vel_z": -2.0,
         "ang_vel_xy": -0.1,
@@ -198,7 +198,7 @@ def curriculum_reward_scales():
         "action_rate": -0.01,
         "action_smoothness": -0.01,
         "power_distribution": -1.0e-5,
-        "similar_to_default": -0.1,
+        "similar_to_default": -0.05,
     }
 
 
@@ -690,11 +690,23 @@ class Go2Env:
 
         The forward cap and its promotion window always load. `load_terrain` also restores the terrain row and the
         promotion streak of every environment, which requires the same number of environments as the saved run.
+        When the saved speed level is past the current `SPEED_VX_CAPS`, it is clamped to the last cap and its
+        promotion window is cleared.
         """
         self._speed_level = state.speed_level
         self._speed_iters_at_cap = state.speed_iters_at_cap
         self._speed_tracking_means = list(state.speed_tracking_means)
         if self._speed_level is not None:
+            max_level = len(SPEED_VX_CAPS) - 1
+            if self._speed_level > max_level:
+                print(
+                    f"speed_curriculum: clamp speed_level {self._speed_level} -> {max_level} "
+                    f"(SPEED_VX_CAPS={SPEED_VX_CAPS})",
+                    flush=True,
+                )
+                self._speed_level = max_level
+                self._speed_iters_at_cap = 0
+                self._speed_tracking_means.clear()
             self.commands_limits[1][0] = SPEED_VX_CAPS[self._speed_level]
             self.command_cfg["lin_vel_x_range"][1] = SPEED_VX_CAPS[self._speed_level]
         if not load_terrain:
