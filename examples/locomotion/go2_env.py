@@ -91,6 +91,12 @@ DEFAULT_RANDOMIZATION = DomainRandomization(
 )
 
 FOOT_LINK_NAMES = ("FR_foot", "FL_foot", "RR_foot", "RL_foot")
+# Thigh joints, in the same order as the feet. The foot hangs from this joint, so it is the hip of the placement
+# target. The hip link is inboard by the abduction offset, and a target there charges a correct stance.
+HIP_LINK_NAMES = ("FR_thigh", "FL_thigh", "RR_thigh", "RL_thigh")
+# Stance duration, in seconds. The env has no gait clock. The placement target leads the hip by half of this times
+# the horizontal base velocity.
+STANCE_DURATION = 0.25
 
 POLICY_MLP = "mlp"
 POLICY_DREAMWAQ = "dreamwaq"
@@ -182,8 +188,15 @@ def curriculum_reward_scales():
     """Return the per-step reward weights of the terrain curriculum.
 
     Each weight multiplies its term once per control step. Linear and yaw tracking are exponentials of the squared
-    velocity error. The remaining terms penalize vertical and roll-pitch velocity, body tilt, joint acceleration,
-    motor power, body height, foot clearance, action changes, uneven motor power, and joint pose away from default.
+    velocity error. The remaining terms penalize vertical and roll-pitch velocity, base tilt, joint acceleration,
+    motor power, base height, foot clearance, foot placement, action changes, uneven motor power, and joint pose
+    away from default.
+
+    Clearance only sees swing-foot height and horizontal foot speed, so a base that drops while the feet keep that
+    swing is free. Base height is what holds the base on its target. Either weight, set past the linear-tracking
+    step, spends the step on height and the commanded velocity drops. Placement pulls every foot toward its hip plus
+    half a stance of horizontal base velocity, and a miss behind the hip costs the same as any other miss of that
+    size. A heavier placement weight pins the feet to the target and the step length collapses.
     """
     return {
         "tracking_lin_vel": 1.5,
@@ -193,8 +206,9 @@ def curriculum_reward_scales():
         "orientation": -1.0,
         "dof_acc": -2.5e-7,
         "joint_power": -2.0e-5,
-        "base_height": -1.0,
-        "feet_clearance": -0.01,
+        "base_height": -70.0,
+        "feet_clearance": -300.0,
+        "feet_placement": -20.0,
         "action_rate": -0.01,
         "action_smoothness": -0.01,
         "power_distribution": -1.0e-5,
@@ -477,9 +491,9 @@ class Go2Env:
                 )
             )
 
-        # The foot is a fixed child of the calf, so the loader folds it into the calf. Clearance and foot contact
+        # The foot is a fixed child of the calf, so the loader folds it into the calf. Clearance and placement
         # read that sphere as its own link, which means naming it here. The flat-ground rewards never read it.
-        needs_feet = "feet_clearance" in self.reward_scales
+        needs_feet = "feet_clearance" in self.reward_scales or "feet_placement" in self.reward_scales
         self.robot = self.scene.add_entity(
             gs.morphs.URDF(
                 file="urdf/go2/urdf/go2.urdf",
@@ -511,6 +525,8 @@ class Go2Env:
         )
         self.actions_dof_idx = torch.argsort(self.motors_dof_idx)
         self._feet_idx = [self.robot.get_link(name).idx_local for name in FOOT_LINK_NAMES] if needs_feet else []
+        needs_placement = "feet_placement" in self.reward_scales
+        self._hip_idx = [self.robot.get_link(name).idx_local for name in HIP_LINK_NAMES] if needs_placement else []
         self._base_link = self.robot.get_link("base")
 
         # PD control parameters
@@ -633,6 +649,7 @@ class Go2Env:
             self._height_scan_offsets = torch.stack((grid_x, grid_y), dim=-1).reshape(-1, 2)
         self._feet_pos = None
         self._feet_vel = None
+        self._hip_pos = None
         self._dof_acc = None
         self._motor_torque = None
         self._motor_power = None
@@ -647,6 +664,7 @@ class Go2Env:
             "joint_power": self._reward_joint_power,
             "base_height": self._reward_base_height,
             "feet_clearance": self._reward_feet_clearance,
+            "feet_placement": self._reward_feet_placement,
             "action_rate": self._reward_action_rate,
             "action_smoothness": self._reward_action_smoothness,
             "power_distribution": self._reward_power_distribution,
@@ -935,10 +953,13 @@ class Go2Env:
         return self.get_observations()
 
     def _read_feet_and_motors(self):
-        needs_feet = "feet_clearance" in self.reward_functions
+        needs_feet = "feet_clearance" in self.reward_functions or "feet_placement" in self.reward_functions
         if needs_feet:
             self._feet_pos = self._batch(self.robot.get_links_pos(self._feet_idx))
+        if "feet_clearance" in self.reward_functions:
             self._feet_vel = self._batch(self.robot.get_links_vel(self._feet_idx))
+        if "feet_placement" in self.reward_functions:
+            self._hip_pos = self._batch(self.robot.get_links_pos(self._hip_idx))
         if "dof_acc" in self.reward_functions:
             self._dof_acc = self._batch(self.robot.get_dofs_acc(self.motors_dof_idx))
         if "joint_power" in self.reward_functions or "power_distribution" in self.reward_functions:
@@ -1302,6 +1323,13 @@ class Go2Env:
         clearance = self._feet_pos[..., 2] - self.terrain_height(self._feet_pos[..., :2])
         speed = torch.linalg.norm(self._feet_vel[..., :2], dim=-1)
         return torch.sum(torch.square(clearance - self.reward_cfg["feet_height_target"]) * speed, dim=1)
+
+    def _reward_feet_placement(self):
+        # Penalize the squared horizontal miss of every foot from its hip plus half a stance of base velocity.
+        # The square charges a foot behind the hip the same as the same distance in any other direction.
+        horizontal_vel = transform_by_quat(self.base_lin_vel, self.base_quat)[:, :2]
+        target = self._hip_pos[..., :2] + horizontal_vel[:, None, :] * (STANCE_DURATION * 0.5)
+        return torch.sum(torch.square(self._feet_pos[..., :2] - target), dim=(1, 2))
 
     def _reward_power_distribution(self):
         # Penalize the square of the variance of signed joint power across the motors
