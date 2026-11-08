@@ -253,6 +253,7 @@ def test_dreamwaq_terrain_rows(n_envs, show_viewer, locomotion):
     assert not bool(env.reset_buf.any())
 
     # Placement charges a foot only on the step it lands. A foot already down costs nothing, however far it is.
+    # Along the velocity, a foot ahead of the target pays nothing. A foot behind it, and any lateral miss, still cost.
     env.reset()
     for _ in range(20):
         env.step(actions)
@@ -262,7 +263,23 @@ def test_dreamwaq_terrain_rows(n_envs, show_viewer, locomotion):
     env._foot_contact.zero_()
     env.step(actions)
     assert bool(env._touchdown.all())
-    assert (env._reward_feet_placement() > 0.0).all()
+    env.base_quat.copy_(identity)
+    env.base_lin_vel.zero_()
+    env.base_lin_vel[:, 0] = 1.0
+    env._hip_pos.zero_()
+    env._feet_pos.zero_()
+    shortfall = go2_env.STANCE_DURATION * 0.5
+    lateral = 0.05
+    env._feet_pos[:, 1, 0] = 2.0 * shortfall
+    env._feet_pos[:, 2, 0] = shortfall
+    env._feet_pos[:, 2, 1] = lateral
+    env._feet_pos[:, 3, 1] = lateral
+    placement_cost = 2.0 * shortfall**2 + 2.0 * lateral**2
+    assert_allclose(env._reward_feet_placement(), placement_cost, atol=1.0e-6, rtol=0.0)
+    env.base_lin_vel.zero_()
+    env._feet_pos.zero_()
+    env._feet_pos[:, 0, 0] = shortfall
+    assert_allclose(env._reward_feet_placement(), shortfall**2, atol=1.0e-6, rtol=0.0)
 
     # Close the stair episode while the horizon is still long, then shorten it. The following reset sees no lived steps.
     env.reset()

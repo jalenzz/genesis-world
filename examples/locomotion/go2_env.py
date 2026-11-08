@@ -196,8 +196,8 @@ def curriculum_reward_scales():
 
     Base height and clearance keep the weights of checkpoint 15999. Its base holds 0.36 m against the 0.30 m target,
     so a heavier height weight pulls the base down, and clearance multiplies by foot speed, so a heavier clearance
-    weight charges every fast swing. Placement charges the touchdown step only. On 15999 it averages 0.002 a step on
-    flat ground at 0.5 to 1.25 m/s and 0.008 on row 4 at 1.25 m/s, about the same at every speed.
+    weight charges every fast swing. Placement charges the touchdown step only. Along the base velocity, a foot ahead
+    of the target pays nothing, and a foot behind it is charged together with the lateral miss.
     """
     return {
         "tracking_lin_vel": 1.5,
@@ -1334,13 +1334,22 @@ class Go2Env:
         return torch.sum(torch.square(clearance - self.reward_cfg["feet_height_target"]) * speed, dim=1)
 
     def _reward_feet_placement(self):
-        # Penalize the squared horizontal miss of a foot from its hip plus half a stance of base velocity, on the step
-        # the foot touches down. Only touchdown has this target: through stance the foot slides behind the hip by
-        # velocity times stance, so a per-step charge grows with speed and pays the policy to walk slower.
+        # Penalize a foot that lands short of its hip plus half a stance of base velocity, on the touchdown step.
+        # Along the velocity, a foot ahead of that target pays nothing. Charging it would pay the policy to shorten
+        # the step. The lateral miss is charged either way. Only touchdown has this target: through stance the foot
+        # slides behind the hip by velocity times stance, so a per-step charge grows with speed and pays the policy
+        # to walk slower.
         horizontal_vel = transform_by_quat(self.base_lin_vel, self.base_quat)[:, :2]
         target = self._hip_pos[..., :2] + horizontal_vel[:, None, :] * (STANCE_DURATION * 0.5)
-        miss = torch.sum(torch.square(self._feet_pos[..., :2] - target), dim=-1)
-        return torch.sum(miss * self._touchdown, dim=1)
+        foot_miss = self._feet_pos[..., :2] - target
+        speed = torch.linalg.norm(horizontal_vel, dim=-1, keepdim=True)
+        is_moving = speed > gs.EPS
+        direction = torch.where(is_moving, horizontal_vel / speed.clamp(min=gs.EPS), torch.zeros_like(horizontal_vel))
+        along_offset = torch.sum(foot_miss * direction[:, None, :], dim=-1)
+        lateral_miss = foot_miss - along_offset[..., None] * direction[:, None, :]
+        shortfall = torch.clamp(-along_offset, min=0.0)
+        squared_miss = torch.square(shortfall) + torch.sum(torch.square(lateral_miss), dim=-1)
+        return torch.sum(squared_miss * self._touchdown, dim=1)
 
     def _reward_power_distribution(self):
         # Penalize the square of the variance of signed joint power across the motors
