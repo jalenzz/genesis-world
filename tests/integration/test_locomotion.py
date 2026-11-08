@@ -107,12 +107,16 @@ def test_curriculum_config(locomotion):
     env_cfg["policy"] = go2_env.POLICY_DREAMWAQ
     assert go2_env.is_dreamwaq_policy(env_cfg)
     scales = reward_cfg["reward_scales"]
-    assert_allclose(scales["tracking_lin_vel"], 1.0, atol=0.0, rtol=0.0)
+    assert_allclose(scales["tracking_lin_vel"], 1.5, atol=0.0, rtol=0.0)
     assert_allclose(scales["tracking_ang_vel"], 0.5, atol=0.0, rtol=0.0)
     assert_allclose(scales["lin_vel_z"], -2.0, atol=0.0, rtol=0.0)
+    assert_allclose(scales["base_height"], -1.0, atol=0.0, rtol=0.0)
     assert_allclose(scales["feet_clearance"], -0.01, atol=0.0, rtol=0.0)
+    assert_allclose(scales["feet_placement"], -50.0, atol=0.0, rtol=0.0)
+    assert_allclose(scales["ang_vel_xy"], -0.1, atol=0.0, rtol=0.0)
+    assert_allclose(scales["orientation"], -1.0, atol=0.0, rtol=0.0)
+    assert_allclose(scales["similar_to_default"], -0.05, atol=0.0, rtol=0.0)
     assert "feet_air_time" not in scales
-    assert "similar_to_default" not in scales
     assert_allclose(command_cfg["lin_vel_x_range"], [-1.0, 1.0], atol=0.0, rtol=0.0)
     assert_allclose(command_cfg["lin_vel_y_range"], [-0.5, 0.5], atol=0.0, rtol=0.0)
     assert_allclose(command_cfg["ang_vel_range"], [-1.0, 1.0], atol=0.0, rtol=0.0)
@@ -122,7 +126,7 @@ def test_curriculum_config(locomotion):
     assert go2_env.raised_speed_cap(0, 100, [0.54] * 100) == (0, None)
     assert go2_env.raised_speed_cap(0, 99, [0.9] * 99) == (0, None)
     assert go2_env.raised_speed_cap(0, 100, [0.0] * 50 + [0.9] * 50)[0] == 1
-    assert go2_env.raised_speed_cap(4, 200, [0.9] * 200) == (4, None)
+    assert go2_env.raised_speed_cap(1, 100, [0.9] * 100) == (1, None)
     randomization = env_cfg["randomization"]
     assert_allclose(randomization["payload"], (-1.0, 2.0), atol=0.0, rtol=0.0)
     assert_allclose(randomization["friction_coefficient"], (0.2, 1.25), atol=0.0, rtol=0.0)
@@ -248,6 +252,35 @@ def test_dreamwaq_terrain_rows(n_envs, show_viewer, locomotion):
     assert not bool(env.is_fallen.any())
     assert not bool(env.reset_buf.any())
 
+    # Placement charges a foot only on the step it lands. A foot already down costs nothing, however far it is.
+    # Along the velocity, a foot ahead of the target pays nothing. A foot behind it, and any lateral miss, still cost.
+    env.reset()
+    for _ in range(20):
+        env.step(actions)
+    assert bool(env._foot_contact.all())
+    assert not bool(env._touchdown.any())
+    assert_allclose(env._reward_feet_placement(), 0.0, atol=0.0, rtol=0.0)
+    env._foot_contact.zero_()
+    env.step(actions)
+    assert bool(env._touchdown.all())
+    env.base_quat.copy_(identity)
+    env.base_lin_vel.zero_()
+    env.base_lin_vel[:, 0] = 1.0
+    env._hip_pos.zero_()
+    env._feet_pos.zero_()
+    shortfall = go2_env.STANCE_DURATION * 0.5
+    lateral = 0.05
+    env._feet_pos[:, 1, 0] = 2.0 * shortfall
+    env._feet_pos[:, 2, 0] = shortfall
+    env._feet_pos[:, 2, 1] = lateral
+    env._feet_pos[:, 3, 1] = lateral
+    placement_cost = 2.0 * shortfall**2 + 2.0 * lateral**2
+    assert_allclose(env._reward_feet_placement(), placement_cost, atol=1.0e-6, rtol=0.0)
+    env.base_lin_vel.zero_()
+    env._feet_pos.zero_()
+    env._feet_pos[:, 0, 0] = shortfall
+    assert_allclose(env._reward_feet_placement(), shortfall**2, atol=1.0e-6, rtol=0.0)
+
     # Close the stair episode while the horizon is still long, then shorten it. The following reset sees no lived steps.
     env.reset()
     env.max_episode_length = 1
@@ -294,7 +327,8 @@ def test_dreamwaq_terrain_rows(n_envs, show_viewer, locomotion):
         ),
         load_terrain=False,
     )
-    assert_allclose(env.speed_vx_cap, go2_env.SPEED_VX_CAPS[2], atol=0.0, rtol=0.0)
+    expected_level = min(2, len(go2_env.SPEED_VX_CAPS) - 1)
+    assert_allclose(env.speed_vx_cap, go2_env.SPEED_VX_CAPS[expected_level], atol=0.0, rtol=0.0)
     assert_equal(env.terrain_levels, restored_levels)
     env.terrain_levels.zero_()
     env.load_curriculum_state(saved, load_terrain=True)
