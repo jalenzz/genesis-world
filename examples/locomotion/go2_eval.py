@@ -17,6 +17,9 @@ import genesis as gs
 from dreamwaq import CurriculumRunner
 from go2_env import TERRAIN_KINDS, Go2Env
 
+# Distance from the far x edge of the mesh, in meters, past which an episode no longer scores falls
+OFF_MESH_MARGIN_M = 0.5
+
 
 def make_eval_env(
     exp_name,
@@ -189,6 +192,9 @@ def run_metrics(args):
     origin_x = env.base_pos[:, 0].clone()
     fell = torch.zeros((env.batch_size,), dtype=torch.bool, device=gs.device)
     height_fell = torch.zeros_like(fell)
+    # The mesh stops after the requested row, so a fast walker can run off its far edge before 4 s and drop below the
+    # ground. Falls stop counting once the base is within OFF_MESH_MARGIN_M of that edge.
+    off_mesh = torch.zeros_like(fell)
     dx_4s = torch.zeros((env.batch_size,), dtype=gs.tc_float, device=gs.device)
     vx_sum = torch.zeros((env.batch_size,), dtype=gs.tc_float, device=gs.device)
     track_sum = torch.zeros((env.batch_size,), dtype=gs.tc_float, device=gs.device)
@@ -209,8 +215,10 @@ def run_metrics(args):
                 track_sum += torch.exp(-vel_error / sigma)
                 dx_4s = env.base_pos[:, 0] - origin_x
             height = env.base_pos[:, 2] - env.terrain_height(env.base_pos[:, :2])
-            fell |= env.is_fallen
-            height_fell |= height < 0.15
+            if env.terrain is not None:
+                off_mesh |= env.base_pos[:, 0] > env._terrain_span_x - OFF_MESH_MARGIN_M
+            fell |= env.is_fallen & ~off_mesh
+            height_fell |= (height < 0.15) & ~off_mesh
             if camera is not None and step + 1 == video_steps:
                 camera.stop_recording()
                 camera = None
@@ -228,7 +236,7 @@ def run_metrics(args):
     )
     print(f"dt={env.dt} steps_4s={steps_4s} steps_total={steps_total}")
     print(f"mean_abs_action={mean_abs_action:.6f}")
-    print("fall=base_contact_or_tilt_limit height_collapse_m=0.150")
+    print(f"fall=base_contact_or_tilt_limit height_collapse_m=0.150 off_mesh_margin_m={OFF_MESH_MARGIN_M}")
 
     if mean_abs_action < 1.0e-4 and float(torch.max(torch.abs(dx_4s))) < 0.01:
         raise SystemExit("robot is frozen: actions and displacement are both ~0")
@@ -252,6 +260,7 @@ def run_metrics(args):
             n_fall = int((fell & mask).sum())
             n_height = int((height_fell & mask).sum())
             n_either = int(((fell | height_fell) & mask).sum())
+            n_off = int((off_mesh & mask).sum())
             name = kind_names[kind]
             dx = _mean(dx_4s, mask)
             body_vx = _mean(vx_sum / steps_4s, mask)
@@ -261,7 +270,7 @@ def run_metrics(args):
                 f"n={n_eps} dx_4s={dx:.3f} mean_body_vx={body_vx:.3f} tracking={tracking:.3f} "
                 f"falls={n_fall}/{n_eps} fall_rate={n_fall / n_eps:.3f} "
                 f"height_falls={n_height}/{n_eps} either_falls={n_either}/{n_eps} "
-                f"either_rate={n_either / n_eps:.3f}"
+                f"either_rate={n_either / n_eps:.3f} off_mesh={n_off}/{n_eps}"
             )
             print(line)
             reported.append(line)

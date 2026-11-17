@@ -120,7 +120,7 @@ def main():
         default=None,
         help=(
             "Fixed upper end of the forward command, in m/s. Sampling uses [-1, this value] for the whole run. The "
-            "default starts the upper end at 1 and raises it with tracking, up to 2."
+            "default starts the upper end at 1 and raises it with tracking, up to 1.25."
         ),
     )
     parser.add_argument(
